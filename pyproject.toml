@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pytorch-distributed-phase0"
+name = "pytorch-distributed-phase1"
 version = "0.1.0"
-description = "First-principles exercises for CPU distributed training with PyTorch"
+description = "Point-to-point communication exercises for CPU distributed training with PyTorch"
 requires-python = ">=3.11"
 dependencies = ["torch"]
 
