@@ -194,3 +194,11 @@ def test_invalid_protocol_terminates_with_finite_timeout():
     result = run_torchrun("phase1.failures", 2, "--scenario", "receiver_never_receives", timeout=25)
     assert result.returncode != 0
     assert "Timeout" in result.stdout + result.stderr or "timeout" in result.stdout + result.stderr
+
+@pytest.mark.skipif(os.environ.get("PHASE2_RUN_DISTRIBUTED") != "1", reason="opt in to Phase 2 capstone subprocess test")
+def test_phase2_capstone_global_metric():
+    result = run_torchrun("phase2.algorithms", 4, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    capstone = [r for r in records if "global_mean_loss" in r]
+    assert capstone == [{"global_mean_loss": 5.0, "total_examples": 10, "world_size": 4}]

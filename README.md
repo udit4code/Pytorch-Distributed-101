@@ -528,3 +528,7 @@ What I learned about the protocol:
 ```
 
 The goal is not simply to make the command exit. The goal is to be able to draw the protocol, predict where each process can block, explain the tensor movement, and identify which evidence would distinguish a communication mismatch from a normal algorithm bug.
+
+## Phase 2: collective communication
+
+Phase 2 builds on the process and point-to-point exercises above. See the [Phase 2 guide](src/phase2/README.md) for broadcast, reduce, barrier, subgroups, protocol ordering, and the capstone. The communication-critical code is intentionally left as `# TODO: IMPLEMENT` exercises.
