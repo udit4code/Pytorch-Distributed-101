@@ -116,9 +116,27 @@ uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --maste
 uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring
 ```
 
-For each rank, `next_rank = (rank + 1) % world_size` and `prev_rank = (rank - 1 + world_size) % world_size`. A single exchange should make rank 0 receive 3, rank 1 receive 0, rank 2 receive 1, and rank 3 receive 2. Complete `ring_exchange`. Then compare `broken_ring_exchange` (send first) with `safe_ring_exchange`; decide a deterministic order that removes the circular wait. Use an external timeout for the broken variant.
+For each rank, `next_rank = (rank + 1) % world_size` and `prev_rank = (rank - 1 + world_size) % world_size`. A single exchange should make rank 0 receive 3, rank 1 receive 0, rank 2 receive 1, and rank 3 receive 2. Study `ring_exchange`: rank 0 sends first, and the other ranks receive before forwarding. This rank-ordered protocol uses only point-to-point `send` and `recv`, and breaks the circular wait. Then compare `broken_ring_exchange` (every rank sends first) with `safe_ring_exchange`. Use an external timeout for the broken variant.
 
-For repeated circulation, each rank forwards the most recently received rank ID. After three steps, rank 0 should have seen `[0, 3, 2, 1]`. Complete `circulate` and track the values by hand for another rank.
+Run the safe implementation explicitly with:
+
+```bash
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring --scenario safe
+```
+
+The broken pattern is deliberately unsafe; bound it with GNU `timeout` (available as `gtimeout` on macOS when GNU coreutils is installed):
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 gtimeout 15s uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring --scenario broken
+```
+
+For repeated circulation, each rank forwards the most recently received rank ID. `circulate()` repeats the safe exchange and records the initial value plus each received value. Run it with:
+
+```bash
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring --scenario circulate
+```
+
+After three steps, rank 0 should have seen `[0, 3, 2, 1]`. Track the values by hand for another rank: each step moves every payload one neighbor clockwise.
 
 ## 8. Nonblocking communication
 
@@ -146,7 +164,13 @@ Every failure must be bounded. Run the failure module under `torchrun` with a su
 
 ## 11. Ring-gather capstone
 
-Complete `ring_gather(local_tensor)` using only `send`, `recv`, `isend`, and `irecv`. Do not use `all_gather`, `broadcast`, `gather`, `all_reduce`, or another collective. With local values `[0]`, `[1]`, `[2]`, `[3]`, every rank must reconstruct `[0, 1, 2, 3]`. Draw the payload movement for every ring step before coding.
+`ring_gather(local_tensor)` uses only nonblocking point-to-point sends and receives. Do not add `all_gather`, `broadcast`, `gather`, `all_reduce`, or another collective. With local values `[0]`, `[1]`, `[2]`, `[3]`, every rank should reconstruct `[0, 1, 2, 3]`. Draw the payload movement for every ring step and trace the `send_index` and `receive_index` calculations in the implementation.
+
+Run the capstone with four ranks:
+
+```bash
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring --scenario gather
+```
 
 ## 12. Questions
 
@@ -197,7 +221,9 @@ What happens if rank 0 sends but rank 1 never receives? What if rank 1 waits for
 
 ## Running tests
 
-Run the send/recv unit tests from the repository root. Set the Gloo interface in the command so it is available to any distributed subprocesses:
+On macOS, prefix each test command with `GLOO_SOCKET_IFNAME=lo0` to make Gloo use the loopback interface. This avoids Gloo's automatic network-interface selection, which on some Macs can produce IPv6 hostname-resolution warnings or prevent local workers from connecting. The integration-test helper also sets this variable for its `torchrun` subprocesses. On Linux, use `GLOO_SOCKET_IFNAME=lo` instead.
+
+Run the send/recv unit tests from the repository root:
 
 ```bash
 GLOO_SOCKET_IFNAME=lo0 uv run --group dev pytest tests/test_send_recv.py
