@@ -102,13 +102,13 @@ In the naive pattern, both ranks send before receiving. Use an external timeout 
 
 ## 6. Deadlocks
 
-Run deliberately broken cases only in bounded subprocesses. For example:
+Each failure scenario has an eight-second work wait and a ten-second process-group timeout. Still run it in a bounded subprocess because process-group timeouts do not instantly cancel every worker. All scenarios require two ranks except `wrong_source`, which requires three: rank 0 waits for rank 2 while rank 1 sends. For example:
 
 ```bash
-uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.failures --scenario receiver_never_receives
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.failures --scenario receiver_never_receives
 ```
 
-`failures.py` accepts `receiver_never_receives`, `sender_never_sends`, `wrong_source`, `shape_mismatch`, `dtype_mismatch`, `rank_exits_early`, and `circular_wait`; complete them one by one and note the rank, PID, source, destination, operation, shape, dtype, and scenario from trace events. A process-group timeout is not an instant cancellation mechanism, so keep an outer test timeout too.
+For `wrong_source`, change `--nproc-per-node=2` to `--nproc-per-node=3`. The other scenarios are `sender_never_sends`, `shape_mismatch`, `dtype_mismatch`, `rank_exits_early`, and `circular_wait`. Read each JSON trace record's rank, PID, source, destination, operation, shape, dtype, and scenario to see where the protocol diverges.
 
 ## 7. Ring communication
 
