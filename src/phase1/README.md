@@ -86,7 +86,19 @@ These operations form a protocol. If one side never performs the expected matchi
 
 ## 5. Blocking behavior
 
-Complete `bidirectional.py`. First inspect the intentionally naive pattern, where both ranks send before receiving. Predict: **Could this deadlock?** Then implement the ordered version (rank 0 sends then receives; rank 1 receives then sends). Sender and receiver operations must match by peer, tensor contract, and protocol order.
+Run the ordered exchange with exactly two ranks:
+
+```bash
+uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.bidirectional --scenario ordered
+```
+
+Then predict whether the naive pattern could deadlock before trying it:
+
+```bash
+uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.bidirectional --scenario naive
+```
+
+In the naive pattern, both ranks send before receiving. Use an external timeout for this experiment; buffering can affect whether a small message visibly hangs. The ordered version has rank 0 send then receive, while rank 1 receives then sends. Sender and receiver operations must match by peer, tensor contract, and protocol order.
 
 ## 6. Deadlocks
 
