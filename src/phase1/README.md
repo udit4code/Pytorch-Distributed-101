@@ -18,7 +18,7 @@ On macOS, select the loopback interface for local Gloo runs before launching exa
 export GLOO_SOCKET_IFNAME=lo0
 ```
 
-Keep this terminal open while running the commands below. PyTorch uses `GLOO_SOCKET_IFNAME` to select the network interface for Gloo communication.
+Keep this terminal open while running the commands below. PyTorch uses `GLOO_SOCKET_IFNAME` to select the network interface for Gloo communication. The local launch commands use an explicit IPv4 rendezvous address (`127.0.0.1`) so they do not depend on hostname resolution.
 
 ## 2. Point-to-point mental model
 
@@ -41,7 +41,7 @@ Each rank owns separate memory.
 ## 3. send / recv
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.send_recv
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.send_recv
 ```
 
 Complete `sender(dst)` and `receiver(src)` in `send_recv.py` with `dist.send()` and `dist.recv()`. The receiver must allocate a compatible destination tensor before `recv()` because the receive operation writes bytes into storage already allocated by that process.
@@ -49,7 +49,7 @@ Complete `sender(dst)` and `receiver(src)` in `send_recv.py` with `dist.send()` 
 ### Experiment: metadata is a contract
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.send_recv --scenario metadata
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.send_recv --scenario metadata
 ```
 
 The sender has four float values; the receiver intentionally allocates a three-element buffer. Use a bounded run and inspect the error. Then try a four-element integer buffer. **Does `dist.send()` transmit a Python/PyTorch object with arbitrary metadata, or does sender and receiver need to agree on the communication contract?** Do not answer before running the experiment.
@@ -57,19 +57,19 @@ The sender has four float values; the receiver intentionally allocates a three-e
 ### Scalar and rank messages
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.send_recv --scenario scalar
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.send_recv --scenario scalar
 ```
 
 Encode `42` and rank IDs as one-element tensors. Do not use `send_object_list`. To also exercise the rank-ID extension, use four ranks:
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=4 -m phase1.send_recv --scenario scalar
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.send_recv --scenario scalar
 ```
 
 ### Many senders, one receiver
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=4 -m phase1.send_recv --scenario many_to_one
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.send_recv --scenario many_to_one
 ```
 
 Rank 0 receives from sources 1, 2, and 3 explicitly. Output order across processes is not a contract. What happens if rank 0 receives in order 1,2,3 but rank 3 sends first?
@@ -89,13 +89,13 @@ These operations form a protocol. If one side never performs the expected matchi
 Run the ordered exchange with exactly two ranks:
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.bidirectional --scenario ordered
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.bidirectional --scenario ordered
 ```
 
 Then predict whether the naive pattern could deadlock before trying it:
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.bidirectional --scenario naive
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.bidirectional --scenario naive
 ```
 
 In the naive pattern, both ranks send before receiving. Use an external timeout for this experiment; buffering can affect whether a small message visibly hangs. The ordered version has rank 0 send then receive, while rank 1 receives then sends. Sender and receiver operations must match by peer, tensor contract, and protocol order.
@@ -105,7 +105,7 @@ In the naive pattern, both ranks send before receiving. Use an external timeout 
 Run deliberately broken cases only in bounded subprocesses. For example:
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.failures --scenario receiver_never_receives
+uv run -- torchrun --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 -m phase1.failures --scenario receiver_never_receives
 ```
 
 `failures.py` accepts `receiver_never_receives`, `sender_never_sends`, `wrong_source`, `shape_mismatch`, `dtype_mismatch`, `rank_exits_early`, and `circular_wait`; complete them one by one and note the rank, PID, source, destination, operation, shape, dtype, and scenario from trace events. A process-group timeout is not an instant cancellation mechanism, so keep an outer test timeout too.
@@ -113,7 +113,7 @@ uv run -- torchrun --standalone --nproc-per-node=2 -m phase1.failures --scenario
 ## 7. Ring communication
 
 ```bash
-uv run -- torchrun --standalone --nproc-per-node=4 -m phase1.ring
+uv run -- torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29500 -m phase1.ring
 ```
 
 For each rank, `next_rank = (rank + 1) % world_size` and `prev_rank = (rank - 1 + world_size) % world_size`. A single exchange should make rank 0 receive 3, rank 1 receive 0, rank 2 receive 1, and rank 3 receive 2. Complete `ring_exchange`. Then compare `broken_ring_exchange` (send first) with `safe_ring_exchange`; decide a deterministic order that removes the circular wait. Use an external timeout for the broken variant.
@@ -197,16 +197,22 @@ What happens if rank 0 sends but rank 1 never receives? What if rank 1 waits for
 
 ## Running tests
 
-Run the local tests with:
+Run the send/recv unit tests from the repository root. Set the Gloo interface in the command so it is available to any distributed subprocesses:
 
 ```bash
-uv run --group dev pytest
+GLOO_SOCKET_IFNAME=lo0 uv run --group dev pytest tests/test_send_recv.py
 ```
 
-The real multi-process integration tests are opt-in and launch `torchrun` subprocesses:
+Run the complete unit suite:
 
 ```bash
-PHASE1_RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
+GLOO_SOCKET_IFNAME=lo0 uv run --group dev pytest
+```
+
+The real multi-process integration tests are opt-in. Their test helper sets the Gloo interface and selects a free port with `--master-addr=127.0.0.1`, avoiding the hostname-resolution problem seen with `torchrun --standalone` on some Macs:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 PHASE1_RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
 ```
 
 Some integration cases will fail until their exercise TODOs are implemented. Each subprocess has a timeout so a protocol deadlock does not hang pytest indefinitely.

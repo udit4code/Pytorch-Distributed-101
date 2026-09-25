@@ -22,7 +22,16 @@ def run_torchrun(module: str, nproc: int, *args: str, timeout: int = 30):
     env = os.environ.copy()
     env["GLOO_SOCKET_IFNAME"] = "lo0" if platform.system() == "Darwin" else "lo"
     return subprocess.run(
-        [torchrun, "--standalone", f"--nproc-per-node={nproc}", "-m", module, *args],
+        [
+            torchrun,
+            "--nnodes=1",
+            f"--nproc-per-node={nproc}",
+            "--master-addr=127.0.0.1",
+            f"--master-port={port}",
+            "-m",
+            module,
+            *args,
+        ],
         capture_output=True, text=True, timeout=timeout, env=env,
     )
 
