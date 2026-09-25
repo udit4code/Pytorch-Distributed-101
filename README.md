@@ -12,6 +12,14 @@ uv sync --group dev
 
 Use `uv run -- ...` for the commands below. This runs them in the project’s `.venv` with `src/phase1` on the import path. If you prefer an activated virtual environment, activate `.venv` first and omit the `uv run --` prefix. Examples use a 30-second process-group timeout; intentionally broken experiments should also be run under an outer shell/test timeout.
 
+On macOS, select the loopback interface for local Gloo runs before launching examples:
+
+```bash
+export GLOO_SOCKET_IFNAME=lo0
+```
+
+Keep this terminal open while running the commands below. PyTorch uses `GLOO_SOCKET_IFNAME` to select the network interface for Gloo communication.
+
 ## 2. Point-to-point mental model
 
 Each rank owns separate memory.
