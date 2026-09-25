@@ -1,13 +1,13 @@
 """Opt-in real torchrun subprocess tests; enable with PHASE1_RUN_DISTRIBUTED=1."""
 
 import json
+import json
 import os
 import platform
 import re
 import shutil
 import socket
 import subprocess
-import sys
 
 import pytest
 
@@ -45,6 +45,109 @@ def test_basic_send_recv():
     assert "[10, 20, 30]" in result.stdout
 
 
+def test_scalar_tensor_message():
+    result = run_torchrun("phase1.send_recv", 2, "--scenario", "scalar")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "received from rank 0: 42" in result.stdout
+
+
+def test_many_to_one_receives_from_each_sender():
+    result = run_torchrun("phase1.send_recv", 4, "--scenario", "many_to_one")
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rank in (1, 2, 3):
+        assert f"received from rank {rank}: {rank}" in result.stdout
+
+
+def test_ordered_bidirectional_exchange():
+    result = run_torchrun(
+        "phase1.bidirectional", 2, "--scenario", "ordered"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    received = {
+        int(rank): int(value)
+        for rank, value in re.findall(r"rank (\d+) received \[(\d+)\]", result.stdout)
+    }
+    assert received == {0: 20, 1: 10}, result.stdout
+
+
+def test_message_order_maps_by_receive_sequence_not_variable_name():
+    result = run_torchrun("phase1.ordering", 2)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "receive order=B-first: A_buffer=[2], B_buffer=[1]" in result.stdout
+
+    result = run_torchrun(
+        "phase1.ordering", 2, "--receive-order", "A-first"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "receive order=A-first: A_buffer=[1], B_buffer=[2]" in result.stdout
+
+
+def test_tagged_messages_match_by_tag():
+    result = run_torchrun("phase1.ordering", 2, "--scenario", "tags")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "A_buffer=[10], B_buffer=[20]" in result.stdout
+
+
+def test_async_ring_exchange():
+    result = run_torchrun("phase1.async_comm", 4)
+    assert result.returncode == 0, result.stdout + result.stderr
+    pairs = {
+        (int(rank), int(value))
+        for rank, value in re.findall(r"rank (\d+) receives (\d+)", result.stdout)
+    }
+    assert pairs == {(0, 3), (1, 0), (2, 1), (3, 2)}, result.stdout
+
+
+def test_blocking_and_nonblocking_timestamps_follow_local_event_order():
+    result = run_torchrun("phase1.async_comm", 2, "--scenario", "timings")
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [
+        json.loads(line)
+        for line in result.stdout.splitlines()
+        if line.startswith("{") and '"blocking_communication_start"' in line
+    ]
+    assert {record["rank"] for record in records} == {0, 1}, result.stdout
+    for record in records:
+        assert (
+            record["blocking_communication_start"]
+            <= record["blocking_communication_complete"]
+            <= record["blocking_computation_start"]
+            <= record["blocking_computation_end"]
+        )
+        assert (
+            record["nonblocking_communication_start"]
+            <= record["nonblocking_computation_start"]
+            <= record["nonblocking_computation_end"]
+            <= record["nonblocking_wait_start"]
+            <= record["nonblocking_communication_complete"]
+        )
+
+
+def test_blocking_and_nonblocking_timestamps_follow_execution_order():
+    result = run_torchrun("phase1.async_comm", 2, "--scenario", "timings")
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [
+        json.loads(line)
+        for line in result.stdout.splitlines()
+        if line.startswith("{") and '"blocking_communication_start"' in line
+    ]
+    assert {record["rank"] for record in records} == {0, 1}, result.stdout
+    for record in records:
+        assert (
+            record["blocking_communication_start"]
+            <= record["blocking_communication_complete"]
+            <= record["blocking_computation_start"]
+            <= record["blocking_computation_end"]
+        )
+        assert (
+            record["nonblocking_communication_start"]
+            <= record["nonblocking_computation_start"]
+            <= record["nonblocking_computation_end"]
+            <= record["nonblocking_wait_start"]
+            <= record["nonblocking_communication_complete"]
+        )
+
+
 def test_ring_exchange_and_process_isolation():
     result = run_torchrun("phase1.ring", 4)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -52,6 +155,31 @@ def test_ring_exchange_and_process_isolation():
     assert pairs == {(0, 3), (1, 0), (2, 1), (3, 2)}
     pids = {int(pid) for pid in re.findall(r'"pid": (\d+)', result.stdout)}
     assert len(pids) == 4, result.stdout
+
+
+def test_ring_circulation_observes_all_other_rank_values():
+    result = run_torchrun("phase1.ring", 4, "--scenario", "circulate")
+    assert result.returncode == 0, result.stdout + result.stderr
+    observations = {
+        int(rank): [int(value.strip()) for value in values.split(",")]
+        for rank, values in re.findall(r"rank (\d+) saw values \[([^]]+)\]", result.stdout)
+    }
+    assert observations == {
+        0: [0, 3, 2, 1],
+        1: [1, 0, 3, 2],
+        2: [2, 1, 0, 3],
+        3: [3, 2, 1, 0],
+    }, result.stdout
+
+
+def test_safe_ring_exchange():
+    result = run_torchrun("phase1.ring", 4, "--scenario", "safe")
+    assert result.returncode == 0, result.stdout + result.stderr
+    pairs = {
+        (int(rank), int(value))
+        for rank, value in re.findall(r"rank (\d+) receives (\d+)", result.stdout)
+    }
+    assert pairs == {(0, 3), (1, 0), (2, 1), (3, 2)}, result.stdout
 
 
 def test_ring_gather_reconstructs_all_values():
