@@ -147,38 +147,62 @@ Treat this as an algorithm experiment rather than evidence about multi-node
 GPU performance. Native `dist.broadcast` uses backend-specific optimized
 algorithms and should be the production comparison.
 
-#### Measured local results
+#### Detailed local experiment
 
-The following run used four local Gloo ranks on macOS, `float32` tensors, two
-warmups, and seven measured trials per payload size. Times are the median of
-the slowest rank in each trial.
+The experiment varied both dimensions that affect the algorithms:
 
-![Direct fan-out versus tree broadcast benchmark](./broadcast_benchmark_results.svg)
+- World sizes: 2, 4, and 8 local Gloo ranks.
+- Payloads: 1, 4, 16, and 64 MiB of `float32` data.
+- Two independent `torchrun` launches for every world-size/payload pair.
+- Three warmups followed by 15 measured trials in each launch, giving 30
+  measured samples per algorithm in each table row.
+- The first launch ran direct fan-out first; the second ran tree first. This
+  reduces systematic bias from always benchmarking one algorithm first.
+- Each trial synchronized ranks before starting. Reported time is the maximum
+  local duration across ranks, because completion is limited by the slowest
+  participant.
 
-| Payload | Direct median | Tree median | Tree improvement |
-|---:|---:|---:|---:|
-| 1 MiB | 0.719 ms | 0.635 ms | 11.7% faster |
-| 2 MiB | 1.038 ms | 0.986 ms | 4.9% faster |
-| 4 MiB | 1.779 ms | 1.925 ms | 8.2% slower |
-| 8 MiB | 3.928 ms | 2.165 ms | 44.9% faster |
-| 16 MiB | 4.216 ms | 4.088 ms | 3.0% faster |
-| 32 MiB | 8.586 ms | 9.088 ms | 5.9% slower |
-| 64 MiB | 17.789 ms | 18.107 ms | 1.8% slower |
+The table reports pooled median latency and the 10th-to-90th percentile range.
+Positive improvement means tree was faster; negative improvement means direct
+fan-out was faster.
 
-These numbers do not consistently justify the hypothesis that tree broadcast
-is faster. Tree won four of seven median comparisons, but it lost at 4, 32,
-and 64 MiB, and only the 8 MiB result showed a large median advantage. The
-min-max whiskers also show scheduling noise and large direct-fan-out outliers
-at 16 and 32 MiB.
+| Ranks | Payload | Direct median [p10–p90] | Tree median [p10–p90] | Tree improvement |
+|---:|---:|---:|---:|---:|
+| 2 | 1 MiB | 0.220 ms [0.200–0.245] | 0.224 ms [0.206–0.295] | -1.8% |
+| 2 | 4 MiB | 0.641 ms [0.627–0.689] | 0.644 ms [0.615–0.688] | -0.5% |
+| 2 | 16 MiB | 3.099 ms [2.837–3.278] | 3.103 ms [2.852–3.591] | -0.1% |
+| 2 | 64 MiB | 5.040 ms [4.946–7.131] | 5.096 ms [4.973–7.180] | -1.1% |
+| 4 | 1 MiB | 0.554 ms [0.302–0.625] | 0.570 ms [0.286–0.670] | -2.9% |
+| 4 | 4 MiB | 1.849 ms [1.096–1.903] | 1.975 ms [1.864–2.073] | -6.8% |
+| 4 | 16 MiB | 4.266 ms [3.931–5.383] | 4.344 ms [3.872–6.061] | -1.8% |
+| 4 | 64 MiB | 17.140 ms [15.895–20.186] | 18.814 ms [16.132–21.743] | -9.8% |
+| 8 | 1 MiB | 0.770 ms [0.647–1.214] | 0.657 ms [0.593–1.250] | +14.7% |
+| 8 | 4 MiB | 2.511 ms [2.260–4.085] | 2.366 ms [2.173–4.663] | +5.8% |
+| 8 | 16 MiB | 10.625 ms [9.816–11.470] | 12.664 ms [11.952–15.093] | -19.2% |
+| 8 | 64 MiB | 40.984 ms [38.024–43.466] | 59.602 ms [53.528–65.621] | -45.4% |
 
-The theoretical claim is about scaling with the number of ranks. Direct
-fan-out makes the source perform `P - 1` sequential sends, whereas this tree
-uses `log2(P)` communication rounds and shares sending work among informed
-ranks. This experiment held `P = 4` constant and varied only payload size, so
-it cannot validate that scaling claim. On one machine, all ranks also contend
-for the same CPU, memory subsystem, and loopback transport. A stronger test
-would vary the world size across 2, 4, 8, and more ranks, repeat complete runs,
-and ultimately measure across multiple hosts.
+#### Does this support the hypothesis?
+
+Only partially. The two-rank case is a sanity check: both implementations
+perform the same single `R0 -> R1` transfer, and their medians differ by at
+most 1.8%. At eight ranks, the tree improved median latency for the 1 and 4
+MiB payloads. That is consistent with the expected benefit of replacing seven
+sequential source sends with three communication rounds.
+
+The result reverses for larger payloads. At eight ranks, tree was 19.2% slower
+for 16 MiB and 45.4% slower for 64 MiB. All ranks run on one host, so the tree's
+simultaneous sends compete for the same loopback transport, memory bandwidth,
+CPU time, and memory-copy resources. The topology has no independent network
+links for the tree to exploit. Forwarding a large tensor through intermediate
+ranks can therefore add contention rather than increase useful aggregate
+bandwidth.
+
+The measurements support a narrower conclusion: on this machine, the tree can
+reduce latency for small messages as rank count grows, while direct fan-out is
+better for the tested large messages. They do not prove that tree broadcast is
+universally faster. Testing the distributed-systems hypothesis requires
+multiple hosts with independent links, repeated runs, and comparison with the
+backend's optimized `dist.broadcast` implementation.
 
 ## 6. Reduce semantics
 

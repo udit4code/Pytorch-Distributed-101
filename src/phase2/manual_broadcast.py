@@ -39,7 +39,7 @@ def manual_broadcast(tensor: torch.Tensor, src: int) -> torch.Tensor:
 # Direct fan-out makes the source send world_size - 1 copies sequentially. A
 # tree spreads that work across ranks that have already received the value, so
 # the number of communication rounds grows logarithmically for power-of-two
-# world sizes.
+# world sizes.  Thus, Tree broadcast is especially attractive because it reduces the latency term from \(O(P)\) to \(O(\log P)\)
 def tree_broadcast(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcast from rank zero through a binary tree of point-to-point calls."""
     rank = dist.get_rank()

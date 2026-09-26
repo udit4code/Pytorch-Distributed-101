@@ -100,6 +100,12 @@ def main() -> None:
         choices=("manual", "tree", "both"),
         default="both",
     )
+    parser.add_argument(
+        "--order",
+        choices=("manual-first", "tree-first"),
+        default="manual-first",
+        help="execution order when --algorithm=both",
+    )
     parser.add_argument("--elements", type=int, default=1_000_000)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--trials", type=int, default=5)
@@ -119,13 +125,23 @@ def main() -> None:
         world_size = dist.get_world_size()
         tensor = torch.empty(args.elements, dtype=torch.float32)
 
-        selected: list[tuple[str, BroadcastAlgorithm]] = []
-        if args.algorithm in ("manual", "both"):
-            selected.append(("manual", manual_broadcast))
+        algorithms = {
+            "manual": manual_broadcast,
+            "tree": tree_broadcast,
+        }
         if args.algorithm in ("tree", "both"):
             if world_size & (world_size - 1) != 0:
                 raise ValueError("tree benchmark requires a power-of-two world size")
-            selected.append(("tree", tree_broadcast))
+
+        if args.algorithm == "both":
+            names = (
+                ("manual", "tree")
+                if args.order == "manual-first"
+                else ("tree", "manual")
+            )
+        else:
+            names = (args.algorithm,)
+        selected = [(name, algorithms[name]) for name in names]
 
         results = []
         for name, algorithm in selected:
