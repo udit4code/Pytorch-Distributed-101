@@ -2,6 +2,64 @@
 
 *A first-principles guide to memory, communication, and reliable training.*
 
+## Before we begin: does parallelism also apply to inference?
+
+**Yes. DP, TP, and PP apply to both training and inference.** Parallelism
+divides work or storage across processing resources. Inference still
+performs matrix multiplications, stores model weights, and moves intermediate
+tensors. Removing backward computation does not remove those costs.
+Multiple GPUs can be in one machine; multiple machines are not required.
+
+For ordinary inference with fixed weights, the three strategies have these
+roles:
+
+| Strategy | Role in inference | Main tradeoff |
+| --- | --- | --- |
+| DP | Replicate the model and route different requests to different replicas. Each replica may itself use TP and PP. | More aggregate request capacity, but duplicated weights. Independent dense-model replicas need no training-style gradient synchronization. |
+| TP | Split layer operations across GPUs that cooperate on the same request or batch. | Lower weight storage per GPU and potentially faster layer execution, paid for with collectives inside the forward pass. |
+| PP | Place successive layers on different GPUs and pass activations between stages. | Distributes model storage, but one request must still traverse the stages in order. Multiple requests or microbatches are needed to keep stages occupied. |
+
+These are implemented serving strategies; see the
+[vLLM parallelism guide](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/).
+
+**Why inference needs a different calculation.** Ordinary inference stores
+no optimizer state or parameter-gradient buffers and does not retain a
+training backward graph. It still needs forward workspaces and intermediate
+activations. Autoregressive Transformer serving also typically retains a
+**KV cache**: past tokens' attention keys and values, so each new token can
+reuse them. Its memory grows with cached sequence length and concurrent
+requests, subject to the attention architecture and caching policy.
+
+For example, a 70B model with two-byte weights needs:
+
+$$
+M_{\mathrm{weights}}=70\times10^9\times2\ \mathrm{bytes}=140\ \mathrm{GB}.
+$$
+
+This counts only weights. The later training example assumes 16 bytes of
+persistent training state per parameter, giving 1.12 TB. Neither number alone
+is the complete memory requirement. In particular, the training GPU-count
+bound must not be reused as an inference bound.
+
+**Latency changes the preference.** Standard autoregressive generation has
+two phases. *Prefill* processes the known prompt, with substantial parallel
+work across its positions. *Decode* generates successive tokens; the next
+token depends on the previous sampled token. TP can divide the work within
+each decode step, but its communication can dominate small operations.
+PP can distribute layers, but it cannot remove the dependency that makes
+one request traverse every stage before its next decode step. Independent
+requests provide additional work to fill that pipeline. DP can reduce
+queueing under load, but it does not divide one request's computation.
+
+The inference decision is therefore: **does the model plus cache fit, and
+does the layout meet time-to-first-token, time-between-tokens, and request
+throughput targets?** The rest of this document focuses on synchronous
+training. Its ownership and dependency reasoning carries over; its optimizer
+memory, backward communication, and training pipeline formulas must be
+rederived for inference.
+
+---
+
 A GPU can perform an operation only when its inputs are available and its intermediate results fit in memory. Splitting a model across GPUs changes where those inputs live. The computation gets smaller, but some dependencies become network transfers.
 
 That is the central tradeoff. To choose a layout, answer three questions in order:
@@ -639,6 +697,235 @@ reduces to $(m+K-1)t$, matching the balanced forward-pass derivation.
 A training schedule shares stage resources between forward and backward, so use its actual dependency schedule for the complete timing. Equal layer counts do not imply equal time: embeddings, output heads, attention shapes, recomputation, and boundary transfers differ.
 
 A stage partition is acceptable only when both its peak memory and service time are acceptable.
+
+## TP versus PP: which dependency should cross a device boundary?
+
+**Prefer TP when useful parallel work is inside a layer. Prefer PP when
+useful parallel work comes from different microbatches occupying different
+layers.** Both can reduce model-state memory. Their different dependencies
+determine when that memory saving produces a faster training job.
+
+### Establish a fair comparison
+
+Hold the training objective, global batch, sequence length, precision,
+optimizer, GPU count, and DP degree fixed. Let $Q=TK$ be GPUs per model
+replica. Compare pure TP, $(T,K)=(Q,1)$, with pure PP,
+$(T,K)=(1,Q)$, before considering a hybrid.
+
+Under balanced ownership, both assign approximately $N/Q$ parameters to
+each GPU. **Parameter-memory savings alone do not distinguish them.**
+The differences are indivisible layers, dynamic memory, kernel shapes,
+communication, and scheduling.
+
+Do not improve one candidate by silently changing the batch or recomputation
+policy. If a candidate requires a different policy to fit, include its
+memory benefit and compute cost explicitly.
+
+### Prefer TP when a layer cannot fit, or the batch cannot fill a pipeline
+
+**An indivisible layer is too large.** Ordinary layer-boundary PP can move
+a layer to another GPU, but it cannot shrink that layer. If a layer's
+required state and workspace exceed the device budget, pure PP is
+infeasible regardless of the number of stages. TP can divide its matrices
+and operations if the implementation supports that partition.
+
+For example, suppose one layer alone owns $80\ \mathrm{GB}$ of persistent
+training state and usable device memory is $48\ \mathrm{GB}$. PP cannot
+place it. Ideal TP of degree two reduces that state to
+$40\ \mathrm{GB/rank}$, leaving only $8\ \mathrm{GB}$ for dynamic state.
+TP of degree two is a capacity candidate, not a guaranteed fit:
+replicated tensors and workspaces still have to be counted.
+
+**Few microbatches are available.** A microbatch must traverse PP stages
+in dependency order. With one microbatch, stage 2 cannot process it
+before stage 1 produces its input. TP instead lets several GPUs work on
+different parts of its current layer.
+
+For a balanced $Q$-stage fill/drain schedule:
+
+$$
+U_{\mathrm{PP}}=\frac{m}{m+Q-1}.
+$$
+
+With $Q=8$ and $m=4$, occupancy is only $4/11\approx36.4\%$.
+TP has no pipeline fill/drain bubble, although it still pays collective
+waits and may have inefficient kernels. If fixed batch and minimum
+efficient microbatch size prevent increasing $m$, TP is often the better
+throughput candidate on a fast fabric. Pure PP can still be the only
+feasible option if the operations cannot be tensor-partitioned.
+
+**One layer dominates compute.** PP moves that bottleneck between stages.
+TP can divide the expensive operation among devices. This is useful only
+if that operation scales: a large indivisible kernel or unsupported
+operation cannot be accelerated by merely creating a TP group.
+
+The intuition is that TP creates concurrency within a microbatch.
+That concurrency is worth paying for when PP cannot obtain enough
+concurrency from separate microbatches.
+
+### Prefer PP when layers fit, the batch is large enough, and TP traffic is expensive
+
+**Depth supplies enough balanced stages.** If every layer fits and the
+model has many similarly expensive blocks, PP can distribute persistent
+state while retaining whole-layer matrix shapes. It avoids shrinking every
+matrix by the TP degree. This can preserve kernel efficiency, especially
+when TP would leave narrow matrices.
+
+**The pipeline has enough work to fill it.** In the simple model, at
+least $9(Q-1)$ microbatches give $90\%$ compute occupancy. For eight
+stages, that is 63 microbatches. Check both
+$m=B/(Db)$ and the activation memory required by the selected schedule.
+Large accumulation does not make its retained activations free.
+
+**Frequent collectives would cross slow links.** TP communicates inside
+the block dependency path. PP sends activations and activation gradients
+at stage boundaries. Moving a boundary onto a slower link can therefore
+be cheaper than using that link inside every block.
+
+For the specific four-AllReduces-per-block TP layout derived above,
+one microbatch on a pure-TP replica causes per-rank sent volume:
+
+$$
+V_{\mathrm{TP/rank/microbatch}}\approx 8L\frac{Q-1}{Q}X.
+$$
+
+Each pure-PP boundary carries $2X$ bytes across forward and backward.
+An interior stage participates in four transfers: forward receive/send
+and backward receive/send. It sends approximately $2X$ bytes and receives
+another $2X$; the end stages participate in fewer transfers.
+
+The important difference is frequency: TP traffic at each rank grows
+with block count $L$, while an ordinary PP stage has at most two adjacent
+boundaries. This is not a speedup ratio. Collective routes, different
+links, concurrent stages, and shared NICs determine how those bytes
+translate into elapsed time. Large boundary tensors can still make PP
+network-bound.
+
+**TP has exhausted useful shard size.** For dense block matmuls, local
+compute roughly scales as $bSh^2/T$, while activation-sized communication
+scales with $bSh$ and does not fall as $1/T$. Increasing $T$ can make
+communication dominate and can lower sustained matmul throughput.
+PP is then a candidate for further memory distribution, provided the
+additional stages can be filled and balanced. These scaling relationships
+omit attention's sequence-quadratic work and use a fixed block shape.
+
+### Derive the break-even condition
+
+Let $c$ be the full model's forward-plus-backward **compute-only** time
+for one microbatch on one GPU. It can be estimated from local kernel
+measurements even if the complete training state cannot fit on one GPU.
+For this derivation, assume ideal compute scaling, equal kernel efficiency,
+balanced PP stages, the simple fill/drain schedule, and sufficient memory.
+
+Let $A_{\mathrm{TP}}$ be the TP candidate's communication delay on its
+critical path over an update. Let $E_{\mathrm{PP}}$ be the PP candidate's
+additional elapsed delay beyond its compute-only pipeline schedule.
+The latter must include communication effects during fill and drain.
+Neither quantity is aggregate cluster communication time.
+
+Then:
+
+$$
+t_{\mathrm{TP}}\approx\frac{mc}{Q}+A_{\mathrm{TP}}.
+$$
+
+$$
+t_{\mathrm{PP}}\approx\frac{(m+Q-1)c}{Q}+E_{\mathrm{PP}}.
+$$
+
+Both execute $mc/Q$ useful compute per GPU. PP adds
+$(Q-1)c/Q$ of compute-schedule fill/drain overhead. Subtracting the
+expressions gives the decision:
+
+$$
+\text{Prefer TP if}\qquad
+A_{\mathrm{TP}}-E_{\mathrm{PP}}<\frac{(Q-1)c}{Q}.
+$$
+
+**Interpretation:** TP wins when its extra exposed communication costs
+less than the pipeline bubble it avoids. PP wins when avoiding TP
+communication saves more time than its pipeline schedule loses.
+
+If TP and PP achieve different kernel efficiencies, replace the common
+compute baseline with each candidate's measured busy time. If PP stages
+are uneven, use their actual service times. If the schedule changes,
+derive its bubble. The inequality explains the tradeoff under the
+stated model; it is not a universal predictor.
+
+### A numerical example where the preferred strategy reverses
+
+Assume four identical GPUs, $D=1$, $b=1$, and a model that fits either
+layout with the same precision and recomputation policy. Each whole layer
+fits. Assume $c=40\ \mathrm{ms}$ and ideal four-way compute division,
+so useful compute is $10\ \mathrm{ms}$ per GPU per microbatch.
+
+Suppose profiling the relevant communication paths supports these
+illustrative service estimates:
+
+- TP exposes $4\ \mathrm{ms}$ of communication per microbatch.
+- PP exposes a balanced boundary-service allowance totaling
+  $0.5\ \mathrm{ms}$ per stage per microbatch across forward/backward.
+  This is added to the balanced stage service before applying fill/drain.
+- There is no additional stage imbalance or update overhead.
+
+Under those assumptions:
+
+$$
+t_{\mathrm{TP}}=14m\ \mathrm{ms},\qquad
+t_{\mathrm{PP}}=10.5(m+3)\ \mathrm{ms}.
+$$
+
+The first expression adds compute and TP delay for each microbatch.
+The second charges the PP stage service for $m+3$ slot-equivalents.
+
+| Microbatches per replica | TP update time | PP update time | Preferred under these assumptions |
+| ---: | ---: | ---: | --- |
+| $m=4$ | $56\ \mathrm{ms}$ | $73.5\ \mathrm{ms}$ | TP: PP spends too much time filling/draining |
+| $m=64$ | $896\ \mathrm{ms}$ | $703.5\ \mathrm{ms}$ | PP: the bubble is amortized and TP keeps paying communication |
+
+The crossover follows directly:
+
+$$
+14m<10.5(m+3)\quad\Longleftrightarrow\quad m<9.
+$$
+
+At nine microbatches the estimates tie. The rows represent different
+fixed-batch workloads: within each row, TP and PP process the same batch.
+They do not justify increasing a real job's global batch merely to make
+PP look faster. If the larger batch fits the training objective but its
+PP activation footprint does not fit memory, that candidate is rejected.
+
+### When a hybrid is the answer
+
+Suppose eight GPUs within each node share fast links, but links between
+nodes are slower. TP inside a node can divide wide layers efficiently;
+PP between nodes can distribute additional depth without extending
+every TP collective over the slow links.
+
+That motivates testing $T\le8$ with enough PP stages to fit. It does not
+prove $T=8$ is optimal: $T=4$ with more stages could preserve larger local
+matrices, while a small batch could make those extra stages too costly.
+The composition and its communication/scheduling tradeoffs are also studied
+in the [Megatron-LM scaling paper](https://arxiv.org/abs/2104.04473).
+
+Use this decision table to make the argument specific:
+
+| Binding constraint or observation | Candidate to prefer | Reason and required check |
+| --- | --- | --- |
+| An individual layer cannot fit | TP, potentially inside PP | Partition the layer; verify supported shards and dynamic memory |
+| Too few microbatches at the permitted batch | TP | Obtain concurrency within a microbatch; measure collective delay |
+| One supported layer dominates runtime | TP or TP within a stage | Split that computation; confirm it scales |
+| Many balanced layers; enough microbatches | PP | Amortize fill/drain while preserving whole-layer kernels |
+| TP would cross slow links repeatedly | PP across those links | Move traffic to stage boundaries; check aggregate NIC demand |
+| TP matrices are too small for efficient kernels | Smaller TP plus PP | Recover kernel efficiency; budget the new bubble |
+| Activations, rather than persistent state, dominate memory | Measure both | TP may replicate activations; PP can retain multiple microbatches |
+| Neither candidate fits or meets the deadline | Revise constraints | A parallelism label cannot remove a capacity or compute deficit |
+
+An interview answer should identify the binding constraint first, then
+compare the extra communication TP creates with the idle time PP creates.
+“Wide model means TP; deep model means PP” is only a starting hint.
+The defensible decision includes the layer fit, batch budget, link placement,
+local kernel sizes, and the resulting critical-path time.
 
 ## 9. Worked comparison: 16 GPUs and one fixed training job
 
