@@ -12,9 +12,10 @@ From the repository root:
 
 ```bash
 uv sync --group dev
-export GLOO_SOCKET_IFNAME=lo0  # macOS; Linux commonly uses lo
-uv run -- torchrun --standalone --nproc-per-node=4 -m phase2.broadcast_demo
 ```
+
+The commands below use the macOS loopback interface, `lo0`. On Linux, replace
+`GLOO_SOCKET_IFNAME=lo0` with `GLOO_SOCKET_IFNAME=lo`.
 
 Run examples with bounded process-group timeouts. The real subprocess tests are opt-in with `PHASE2_RUN_DISTRIBUTED=1 pytest tests/test_broadcast.py`; each subprocess also has an outer timeout. Fill in each TODO, then replace/enable the corresponding scaffold assertions.
 
@@ -42,7 +43,56 @@ A collective is not “rank 0 calls a function that modifies other ranks.” Eve
 
 Broadcast distributes one rank's tensor to all members of the group. The `src` rank supplies the input; all ranks, including source, call the collective. Source's tensor remains available and each non-source tensor buffer receives its contents. `src=0` is a convention in examples, not a special capability of rank zero.
 
-`broadcast_demo.py` begins with source value 100 and placeholders elsewhere. Try `--src 2`; change the source's initialized value to 999 and predict all outputs. Run a delayed participant with `--delay-rank 2 --delay-seconds 3`. Compare before/after timestamps. A participant that has not entered can hold up completion. Collective completion semantics are backend/operation-specific; do not equate broadcast with a barrier.
+`broadcast_demo.py` begins with source value 100 and placeholders elsewhere.
+
+Run a four-rank broadcast from rank zero:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29621 \
+  -m phase2.broadcast_demo \
+  --src 0
+```
+
+Before the collective, rank zero has `[100]` and the other ranks have `[-1]`.
+After it, every rank should have `[100]`.
+
+Run the same experiment with rank two as the source:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29622 \
+  -m phase2.broadcast_demo \
+  --src 2
+```
+
+Rank two starts with `[999]`; after the collective, every rank should have
+`[999]`.
+
+Finally, delay rank two by three seconds and compare the before/after
+timestamps:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29623 \
+  -m phase2.broadcast_demo \
+  --src 0 \
+  --delay-rank 2 \
+  --delay-seconds 3
+```
+
+A participant that has not entered can hold up completion. Collective
+completion semantics are backend/operation-specific; do not equate broadcast
+with a barrier.
 
 ## 4. Manual broadcast
 
@@ -62,6 +112,73 @@ final:  R0 R1 R2 R3 have X
 ```
 
 Draw eight ranks and compare the number of communication rounds with naive fan-out. Do not over-optimize or benchmark localhost performance.
+
+### Broadcast benchmark scaffold
+
+`broadcast_benchmark.py` compares the direct fan-out and binary-tree
+implementations after process-group initialization. It performs warmups,
+checks the received tensor, and reports the slowest rank's elapsed time for
+each trial.
+
+Run four ranks with a one-million-element `float32` tensor (about 4 MB):
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29630 \
+  -m phase2.broadcast_benchmark \
+  --algorithm both \
+  --elements 1000000 \
+  --warmups 2 \
+  --trials 5
+```
+
+Repeat with `--nproc-per-node=2`, `4`, and `8`, using a fresh port for each
+run. Also try several payload sizes such as `1`, `10000`, and `1000000`
+elements. The tree still sends `P - 1` messages overall, but distributes those
+sends across informed ranks and reduces communication depth from roughly
+`P - 1` source sends to `log2(P)` rounds.
+
+Small localhost runs may show direct fan-out winning because process
+scheduling and extra tree coordination can outweigh its theoretical benefit.
+Treat this as an algorithm experiment rather than evidence about multi-node
+GPU performance. Native `dist.broadcast` uses backend-specific optimized
+algorithms and should be the production comparison.
+
+#### Measured local results
+
+The following run used four local Gloo ranks on macOS, `float32` tensors, two
+warmups, and seven measured trials per payload size. Times are the median of
+the slowest rank in each trial.
+
+![Direct fan-out versus tree broadcast benchmark](./broadcast_benchmark_results.svg)
+
+| Payload | Direct median | Tree median | Tree improvement |
+|---:|---:|---:|---:|
+| 1 MiB | 0.719 ms | 0.635 ms | 11.7% faster |
+| 2 MiB | 1.038 ms | 0.986 ms | 4.9% faster |
+| 4 MiB | 1.779 ms | 1.925 ms | 8.2% slower |
+| 8 MiB | 3.928 ms | 2.165 ms | 44.9% faster |
+| 16 MiB | 4.216 ms | 4.088 ms | 3.0% faster |
+| 32 MiB | 8.586 ms | 9.088 ms | 5.9% slower |
+| 64 MiB | 17.789 ms | 18.107 ms | 1.8% slower |
+
+These numbers do not consistently justify the hypothesis that tree broadcast
+is faster. Tree won four of seven median comparisons, but it lost at 4, 32,
+and 64 MiB, and only the 8 MiB result showed a large median advantage. The
+min-max whiskers also show scheduling noise and large direct-fan-out outliers
+at 16 and 32 MiB.
+
+The theoretical claim is about scaling with the number of ranks. Direct
+fan-out makes the source perform `P - 1` sequential sends, whereas this tree
+uses `log2(P)` communication rounds and shares sending work among informed
+ranks. This experiment held `P = 4` constant and varied only payload size, so
+it cannot validate that scaling claim. On one machine, all ranks also contend
+for the same CPU, memory subsystem, and loopback transport. A stronger test
+would vary the world size across 2, 4, 8, and more ranks, repeat complete runs,
+and ultimately measure across multiple hosts.
 
 ## 6. Reduce semantics
 
