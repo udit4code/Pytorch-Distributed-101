@@ -60,6 +60,13 @@ $$
 
 TP and PP do not multiply the batch. The GPUs in one model replica cooperate on the same examples.
 
+**Derivation.** Count the nested groups: each replica has $K$ stages, each stage
+has $T$ GPUs, and there are $D$ replicas. That gives $DTK$ GPUs. Separately,
+each replica processes $m$ microbatches of $b$ sequences, so all replicas
+process $Dmb$ sequences. Each sequence contributes $S$ tokens. These are
+counting identities under the equal-size assumptions; they contain no
+performance claim.
+
 We use decimal units: $1\ \mathrm{GB}=10^9$ bytes,
 $1\ \mathrm{GB/s}=10^9$ bytes/s, and
 $1\ \mathrm{TFLOP/s}=10^{12}$ FLOP/s. Device tools may report GiB:
@@ -79,6 +86,19 @@ $$
 In DP, each replica processes a disjoint subset. If each processes exactly
 $B/D$ examples and computes their mean gradient, averaging those $D$ replica
 gradients gives the global mean.
+
+**Why averaging works.** Differentiation is linear: the derivative of a sum
+is the sum of the derivatives. Each local mean contains a factor $D/B$.
+Averaging those local means multiplies by $1/D$, leaving exactly $1/B$ for
+every example. For unequal replica counts $n_d$, replace the unweighted
+average by the weighted mean:
+
+$$
+g_{\mathrm{global}}=\sum_{d=1}^{D}\frac{n_d}{B}g_d,\qquad B=\sum_{d=1}^{D}n_d.
+$$
+
+Here $g_d$ is replica $d$'s mean over its $n_d$ examples. For a token-mean
+objective, use valid-token counts in both places.
 
 If replicas contain different numbers of valid tokens, an average of replica means is generally wrong. Sum the appropriately weighted gradient contributions and normalize by the total number of valid tokens. Padding masks, uneven batches, and gradient accumulation can all change the required denominator.
 
@@ -118,6 +138,12 @@ $$
 
 Adding the separate maximum of every category gives a conservative estimate, because those maxima may occur at different times. Omitting a category gives a potentially unsafe estimate. Persistent storage, live allocation, and allocator-reserved memory are different quantities; compare them consistently.
 
+**Why the maximum is outside the sum.** At a particular instant, all live
+allocations compete for the same memory. Add those allocations first, then
+look for the worst instant. An average cannot protect against a brief OOM.
+The conservative category-by-category estimate follows from
+$\max_t\sum_j M_j(t)\le\sum_j\max_t M_j(t)$.
+
 ### 3.1 Persistent training state
 
 Consider this **specific** mixed-precision optimizer configuration:
@@ -155,6 +181,14 @@ The division by $TK$ is only a starting estimate. Count replicated parameters,
 uneven stages, padding, shared/tied weights, and any duplicated optimizer state.
 PP requires balancing by bytes as well as time.
 
+**Derivation.** One parameter needs its weight, gradient, and optimizer
+buffers simultaneously, so add their bytes. Multiply by $N$ parameters.
+If ownership is evenly divided among $TK$ GPUs, each owns $N/(TK)$ parameters
+and the corresponding buffers. There is no division by $D$ because every
+replica owns another complete copy. For the example optimizer, the 12-byte
+optimizer/master term is three FP32 values per parameter: a master weight
+and two moments.
+
 ### 3.2 Activations are not parameter memory
 
 One hidden-state tensor contains:
@@ -162,6 +196,11 @@ One hidden-state tensor contains:
 $$
 M_{\mathrm{hidden}} = bShq_a.
 $$
+
+**Derivation.** There are $b$ sequences, $S$ token positions per sequence,
+and $h$ numbers per token position. That is $bSh$ stored numbers. Multiply
+by bytes per number to obtain bytes. A quick units check is
+“elements × bytes/element = bytes.”
 
 For $b=1$, $S=2048$, $h=4096$, and $q_a=2$, that is
 $16{,}777{,}216$ bytes, approximately $16.8\ \mathrm{MB}$. This is the size of
@@ -175,6 +214,12 @@ M_{\mathrm{saved}}
 \sum_{\ell\in\text{local layers}}
 M_{\mathrm{saved},\ell,\mathrm{microbatch}}.
 $$
+
+**Why the factors multiply.** Sum the tensors saved for one microbatch across
+the local layers. If $n_{\text{in flight}}$ microbatches retain comparable
+saved state, there are approximately that many copies. Some may be only
+partly processed, so this product is an inventory approximation; an exact
+peak requires the schedule's allocation and release times.
 
 Make the assumptions behind “saved bytes” explicit. Materializing attention
 scores can introduce storage proportional to $bH S^2$, where $H$ is the
@@ -218,11 +263,29 @@ $$
 
 We count one multiply and one add as two FLOPs. These costs assume both input and weight gradients are required and omit bias, nonlinearities, and optimizer work.
 
+**Derivation.** The output has $nf$ elements. Each is a dot product of length
+$h$, requiring $h$ multiplications and $h-1$ additions: approximately $2h$
+FLOPs per output, hence $2nhf$. Backward contains two matrix multiplications:
+
+$$
+\nabla_X\mathcal{L}=(\nabla_Y\mathcal{L})W^\top,\qquad
+\nabla_W\mathcal{L}=X^\top(\nabla_Y\mathcal{L}).
+$$
+
+Their dimensions give the same $2nhf$ count each. Forward plus the two
+backward products therefore costs approximately $6nhf$.
+
 For dense parameter matrix multiplications across the model, a common first estimate is:
 
 $$
 F_{\mathrm{step}} \approx 6NBS.
 $$
+
+**Where the six comes from.** A matrix with $hf$ parameters costs approximately
+$6hf$ FLOPs to train on one token. Sum over the parameter matrices to replace
+$hf$ by $N$, then multiply by $BS$ tokens. This explains both the coefficient
+and the limitation: operations that are not represented by those parameter
+matrices must be counted separately.
 
 This assumes each counted parameter participates once per token in a matrix multiplication, and forward/backward dominate. Attention's sequence-to-sequence products add work that is not captured by parameter count. Long sequences, embeddings, unusual blocks, and recomputation can make the estimate inaccurate. Use a per-operation inventory when those terms matter.
 
@@ -233,6 +296,11 @@ $$
 T_{\mathrm{compute}}^{\mathrm{ideal}}
 = \frac{F_{\mathrm{step}}}{G C_{\mathrm{eff}}}.
 $$
+
+**Derivation.** Balanced assignment gives each GPU $F_{\mathrm{step}}/G$
+FLOPs. Time is work divided by work per second. This assumes all $G$ GPUs
+can execute their assigned work concurrently; pipeline idle time and
+communication waits are additional schedule effects.
 
 Use sustained throughput for those kernels, not the device's advertised peak.
 Increasing TP narrows local matrices. Increasing DP at fixed $B$ can require a
@@ -249,6 +317,13 @@ $$
 T_{\mathrm{transfer}} \approx \alpha + \frac{V}{\beta}.
 $$
 
+**Intuition.** A transfer pays a fixed startup cost and then a cost for
+moving its payload. The payload costs $V/\beta$ seconds because the link
+moves $\beta$ bytes each second. A tiny message is dominated by startup;
+a large message is dominated by bandwidth. The crossover is
+$V\approx\alpha\beta$. For $V=0$, the model describes an actual empty
+message, not the absence of a communication operation.
+
 Use effective payload bandwidth on the actual route. Shared NICs, link oversubscription, concurrent collectives, host staging, and protocol overhead can reduce it.
 
 A ring AllReduce over $p$ ranks provides a useful derivation. Each rank sends
@@ -261,10 +336,32 @@ V_{\mathrm{ring/rank}}
 $$
 
 $$
-T_{\mathrm{ring}}(p,X)
-\approx 2(p-1)\alpha
-+ \frac{2(p-1)X}{p\beta}.
+T_{\mathrm{ring}}(p,X) \approx 2(p-1)\alpha + \frac{2(p-1)X}{p\beta}.
 $$
+
+**Derivation, one round at a time.** Divide the $X$-byte tensor into $p$
+chunks. During reduce-scatter, ranks send and receive one $X/p$-byte chunk
+per round and accumulate contributions. After $p-1$ rounds, each rank owns
+one fully reduced chunk. During all-gather, another $p-1$ rounds distribute
+those reduced chunks until every rank has the complete result.
+
+Each round costs approximately $\alpha+X/(p\beta)$. The phases are sequential,
+so multiply this round cost by their total round count:
+
+$$
+T_{\mathrm{ring}}(p,X)\approx 2(p-1)\left(\alpha+\frac{X/p}{\beta}\right).
+$$
+
+Expanding the parentheses gives the formula above. The $p$ in the denominator
+comes from chunk size; the $p-1$ comes from ring rounds; the two comes from
+the two phases. It does **not** count forward/backward passes or simultaneous
+sending and receiving.
+
+For example, with four ranks and a 400-MB tensor, each chunk is 100 MB.
+Each rank sends three chunks in each phase: six rounds and 600 MB sent in
+total. The estimate is $6\alpha+600\ \mathrm{MB}/\beta$.
+With one rank it becomes zero, as expected. As $p$ grows, sent volume
+approaches $2X$ while the modeled latency term grows with $p$.
 
 This counts sent bytes. Each rank receives a comparable volume. Do not double the time estimate merely because a full-duplex link can send and receive simultaneously. Conversely, do not use a bidirectional aggregate bandwidth number as a one-direction bandwidth.
 
@@ -290,6 +387,13 @@ $$
 V_{\mathrm{DP/rank/update}}
 \approx 2\frac{D-1}{D}X_{\mathrm{DP}}.
 $$
+
+**Derivation.** A GPU owns approximately $N/(TK)$ parameter gradients, each
+occupying $q_g$ bytes. That gives its DP payload. The $D$ matching shards
+across replicas form the synchronization group, so substitute $p=D$ and
+$X=X_{\mathrm{DP}}$ into the ring-volume formula. With $D=1$, no DP
+synchronization is needed. With gradient accumulation, this volume applies
+once per update only if intermediate microbatches defer synchronization.
 
 For pure DP, $T=K=1$, so each rank communicates the full gradient. In a
 hybrid, a DP group connects matching shards across replicas, not every GPU in
@@ -339,6 +443,20 @@ column-partitioned multiplication must also be combined.
 
 This paired layout uses one AllReduce in forward and one in backward for the MLP, under replicated input/output conventions. A similarly partitioned attention sublayer adds another pair in a conventional Transformer layout. The original [tensor-parallel Transformer design](https://arxiv.org/abs/1909.08053) uses these paired partitions.
 
+**Why the partial outputs add.** Partition the intermediate feature index
+$j$ into disjoint sets $\mathcal{J}_i$. An output element is a sum over that
+index. Each rank evaluates one subset:
+
+$$
+Y_{a,k}=\sum_{j=1}^{f}H_{a,j}(W_2)_{j,k}
+=\sum_{i=1}^{T}\left(\sum_{j\in\mathcal{J}_i}H_{a,j}(W_2)_{j,k}\right).
+$$
+
+The inner sum is rank $i$'s partial output; the outer sum reconstructs the
+answer. An elementwise nonlinearity can be applied independently to the
+columns of $XW_1$. A nonlinearity that couples those columns would need
+additional analysis and possibly communication.
+
 ### A concrete TP cost model
 
 Assume all of the following:
@@ -370,6 +488,17 @@ T_{\mathrm{TP}}^{\text{no overlap}}
 4\frac{L}{K}m\,T_{\mathrm{ring}}(T,X).
 $$
 
+**Count before multiplying.** Each microbatch visits $L/K$ blocks on this
+stage. Each block performs four collectives across forward and backward.
+Repeat for $m$ microbatches to obtain $4(L/K)m$ calls. Multiply by bytes
+per call for volume, or by seconds per call for no-overlap time. These
+are two uses of the same call count; do not add them together.
+
+This per-rank count is not multiplied by $T$: ranks cooperate in each
+collective concurrently. Multiplying by $T$ would instead help estimate
+aggregate traffic across the group. If recomputation reexecutes a
+communication-bearing operation, add its calls to this inventory.
+
 For $T=1$, TP communication is zero. These counts describe this specific
 layout, not every TP implementation. Additional redistribution, different
 attention layouts, or recomputation change the count. Inventory the actual
@@ -399,6 +528,13 @@ V_{\mathrm{backward/microbatch}} &\approx X_{\mathrm{boundary}}, \\
 V_{\mathrm{boundary/update}} &\approx 2mX_{\mathrm{boundary}}.
 \end{aligned}
 $$
+
+**Why there are two payloads.** Forward sends the activation to the next
+stage. Backward sends the derivative with respect to that activation in
+the opposite direction. If both use the same shape and bytes per element,
+they have the same size. Across $m$ microbatches this gives $mX+mX$ bytes.
+With different forward/backward dtypes, use
+$m(X_{\mathrm{forward}}+X_{\mathrm{backward}})$ instead.
 
 That last expression describes a single logical full-tensor transfer per
 direction. In a TP×PP implementation, determine whether the tensor is
@@ -432,6 +568,18 @@ Bubble fraction and overhead relative to useful time have different
 denominators. For $K=4$ and $m=4$, occupancy is $4/7\approx57\%$; for $m=32$,
 it is $32/35\approx91\%$.
 
+**Why the ratios have different denominators.** Each stage has $m$ useful
+microbatch slots inside a schedule spanning $m+K-1$ slots per pass. Occupancy
+is busy time divided by elapsed time. Subtracting busy time from elapsed
+time leaves $K-1$ slot-equivalents of idle time per stage. Divide that idle
+time by elapsed time to get bubble fraction, or by busy time to get the
+overhead multiplier. Thus
+$T_{\mathrm{pipeline}}=T_{\mathrm{busy}}/U$.
+
+Two checks: $K=1$ gives no pipeline bubble, and increasing $m$ at fixed $K$
+drives occupancy toward one. A single microbatch gives $U=1/K$: it cannot
+occupy all stages simultaneously.
+
 This derivation applies to the stated schedule and balance assumptions. Other schedules can alternate forward and backward to reduce live activations or use different partitions to change idle time. Do not use one schedule's memory estimate with another schedule's timing formula. The [pipeline analysis in the large-scale training study](https://arxiv.org/abs/2104.04473) discusses these scheduling and communication tradeoffs.
 
 To target occupancy $u$ in this simple model:
@@ -439,6 +587,12 @@ To target occupancy $u$ in this simple model:
 $$
 m \ge \frac{u(K-1)}{1-u}.
 $$
+
+**Derivation.** Require $m/(m+K-1)\ge u$, with $0<u<1$.
+Multiply by the positive denominator to obtain $m\ge um+u(K-1)$.
+Move $um$ to the left and divide by $1-u$. Since microbatch count is an
+integer, round the resulting lower bound up and require at least one
+microbatch. At $u=0.90$, $u/(1-u)=9$.
 
 For $u=0.90$:
 
@@ -451,6 +605,11 @@ Combine this with the batch equation:
 $$
 \frac{B}{Db} \ge 9(K-1).
 $$
+
+This is the same occupancy requirement with the batch identity substituted
+for $m$. For fixed $B$ and $b$, increasing $D$ leaves fewer microbatches
+inside each pipeline. Batch capacity and pipeline utilization therefore
+cannot be selected independently.
 
 DP and PP therefore compete for the same fixed batch budget. Adding DP replicas reduces the microbatches available to fill each pipeline. Splitting into smaller microbatches may improve the bubble while worsening kernel efficiency and message startup cost.
 
@@ -469,6 +628,13 @@ $$
 T_{\text{forward pipeline}}
 = \sum_{i=1}^{K} t_i + (m-1)\max_i t_i.
 $$
+
+**Derivation.** The first microbatch must traverse every stage, taking
+$\sum_i t_i$. After the pipeline fills, the bottleneck stage can produce
+one result only every $\max_i t_i$ seconds. Each of the remaining $m-1$
+microbatches adds that interval, assuming sufficient buffering and the
+stated deterministic service model. If all stages take $t$, the result
+reduces to $(m+K-1)t$, matching the balanced forward-pass derivation.
 
 A training schedule shares stage resources between forward and backward, so use its actual dependency schedule for the complete timing. Equal layer counts do not imply equal time: embeddings, output heads, attention shapes, recomputation, and boundary transfers differ.
 
@@ -523,6 +689,12 @@ A lower-bound constraint from persistent state alone is:
 $$
 TK \ge \left\lceil\frac{128}{64}\right\rceil = 2.
 $$
+
+**Why divide and round up?** If one replica needs $M$ bytes of state and
+each GPU can supply at most $H$ bytes, $TK$ GPUs supply at most $TKH$.
+Solving $TKH\ge M$ gives $TK\ge M/H$. A fraction of a GPU cannot hold
+the remaining shard, so round up. Total capacity is necessary but does
+not guarantee that a legal partition fits on every individual GPU.
 
 That is necessary, but insufficient: a degree of two leaves no room for dynamic state. The table shows why “it fits by parameter count” is an inadequate conclusion.
 
@@ -624,6 +796,13 @@ T_{\mathrm{PP}}
 +\frac{X}{25\times10^9\ \mathrm{bytes/s}}\right).
 $$
 
+**Derivation.** Each boundary interaction has startup plus payload time.
+An endpoint participates in one forward and one backward interaction per
+microbatch, giving $2m$ such costs in this no-overlap model. For $K=2$
+each stage has only one neighbor. Interior stages in a larger pipeline
+have two neighbors; whether their costs add or overlap depends on links,
+NIC sharing, and the schedule.
+
 For the screening model, treat compute, TP communication, and this PP allowance as nonoverlapping, balanced stage service. Apply the fill/drain multiplier to their sum. Add the exposed DP tail separately:
 
 $$
@@ -636,6 +815,14 @@ T_{\mathrm{step}}
 \frac{T_{\mathrm{compute}}+T_{\mathrm{TP}}+T_{\mathrm{PP}}}{U}
 +T_{\mathrm{DP,exposed}}.
 $$
+
+**Why divide by occupancy?** Let $W$ be the assumed busy service time:
+compute plus the TP and PP costs charged to that stage. If it is busy
+for fraction $U$ of the schedule, then $W=UT_{\mathrm{schedule}}$ and
+$T_{\mathrm{schedule}}=W/U$. The exposed DP tail is added after that
+schedule in this particular model. With a hidden fraction $\eta$, its
+estimate is $(1-\eta)T_{\mathrm{DP}}$; here $(1-0.60)\times0.240=0.096$
+seconds. This is a scheduling assumption, not a general overlap law.
 
 This is a deliberately simplified schedule model. Network contention,
 directional imbalance, or a different schedule requires a timeline rather than
@@ -671,6 +858,12 @@ $$
 $$
 
 Report both throughput and resource cost. Using all available GPUs is useful only if it improves the objective enough to justify the additional cost and failure exposure.
+
+**Units explain the conversion.** Tokens per update divided by seconds
+per update gives tokens per second. GPU-seconds counts allocated devices
+times elapsed seconds; it includes devices waiting in bubbles or at
+collectives. Divide that quantity by tokens per update for GPU-seconds
+per token when comparing jobs of different sizes.
 
 ## 10. Interview case study: training a 70B model with limited GPUs
 
@@ -761,6 +954,16 @@ This is only a lower bound. It does not yet reserve the full dynamic-memory
 requirement, account for uneven stages, or ensure that the chosen degrees are
 supported by the model.
 
+**Intuition for the 18-GPU bound.** Every parameter carries 16 bytes of
+training state, so 70 billion parameters require 1,120 billion bytes.
+At most 64 billion bytes fit within each GPU's planning budget.
+The quotient is $17.5$, which rounds up to 18 devices for persistent
+state alone. This arithmetic says nothing about whether 18 devices form
+a useful TP×PP topology. With 16 devices, even a perfectly balanced
+partition needs $70\ \mathrm{GB}$ per device, exceeding the chosen
+$64\ \mathrm{GB}$ budget. This is infeasibility under the planning
+assumptions, not a proof that every possible 16-GPU implementation fails.
+
 | Available GPUs | Best possible $TK$ when $D=1$ | Ideal state/GPU | Result |
 | ---: | ---: | ---: | --- |
 | 8 | 8 | $140\ \mathrm{GB}$ | Impossible under these assumptions |
@@ -833,6 +1036,10 @@ starting point because the simple “all forward, then all backward” schedule
 can retain activations for many microbatches. The precise live-activation count
 must come from the selected schedule, not from the utilization formula alone.
 
+The remaining $29\ \mathrm{GB}$ is subtraction, not another sharding
+factor: $64-35=29$. Replicated boundary tensors and temporary allocations
+must fit in this remainder even when parameter storage is evenly divided.
+
 Before launching the full job, test one representative stage and verify:
 
 - every TP-sharded dimension supports $T=8$ or has an acceptable padding plan;
@@ -866,6 +1073,12 @@ idealized model. It does not prove that the real schedule achieves $97.7\%$:
 stage imbalance, communication, recomputation, and kernel gaps lower realized
 utilization.
 
+**Reading the substitution.** One replica receives all 128 sequences,
+and a microbatch contains one sequence, so it executes 128 microbatches.
+The simple four-stage schedule adds three fill/drain slot-equivalents
+per pass. Hence 128 busy slots out of 131 total, rather than a new
+empirical utilization constant.
+
 The boundary activation for one microbatch is approximately:
 
 $$
@@ -891,6 +1104,12 @@ This is logical tensor volume. The physical NIC load depends on whether the
 boundary tensor remains sharded across eight rank pairs or is duplicated. Draw
 that layout and sum concurrent bytes at each NIC before accepting the network
 estimate.
+
+The $17.2\ \mathrm{GB}$ follows from 256 transfers of approximately
+$67.1\ \mathrm{MB}$ each: 128 forward and 128 backward. Multiplying by
+three boundaries gives total logical traffic across the pipeline, but
+does not automatically triple elapsed time; separate boundaries can
+be active concurrently.
 
 ### 10.5 Compute and communication napkin math
 
@@ -922,6 +1141,12 @@ T_{\mathrm{compute}}^{\mathrm{ideal}}
 {32\times150\times10^{12}}
 \approx45.9\ \mathrm{s/update}.
 $$
+
+**Derivation in units.** There are $128\times4096$ tokens in the update.
+Each costs approximately $6\times70$ billion FLOPs in the dense-parameter
+model. Divide that work by the assumed aggregate rate of
+$32\times150$ trillion FLOPs per second. The GPU count multiplies
+capacity; it does not reduce the total mathematical work.
 
 Now estimate TP. Assume hidden states are replicated at the relevant block
 boundaries and use the same four-AllReduces-per-block layout derived earlier.
@@ -955,6 +1180,14 @@ T_{\mathrm{TP}}
 \approx4.72\ \mathrm{s/update}.
 $$
 
+**Reading each factor.** A stage executes 20 blocks for each of 128
+microbatches. Four collectives per block gives 10,240 calls. Each call
+has 14 ring rounds: seven reducing and seven distributing. Their
+startup is $14\times5=70$ microseconds. Sent bytes per call are
+$2(7/8)X=1.75X$, giving approximately 391 microseconds at the assumed
+bandwidth. Add the two costs per call, then multiply by call count.
+These times assume serialized calls and no communication overlap.
+
 For one PP endpoint, assuming one full boundary tensor per direction and
 $25\ \mathrm{GB/s}$ effective inter-node bandwidth:
 
@@ -968,8 +1201,8 @@ T_{\mathrm{PP}}
 \end{aligned}
 $$
 
-Under a deliberately conservative model that exposes all TP and PP
-communication and applies the pipeline occupancy once:
+For an illustrative schedule estimate, charge this one-boundary PP cost
+alongside TP and compute, and apply the pipeline occupancy once:
 
 $$
 \begin{aligned}
@@ -980,6 +1213,16 @@ T_{\mathrm{step}}
 &\approx52.5\ \mathrm{s/update}.
 \end{aligned}
 $$
+
+**What this estimate assumes.** The $45.9+4.72+0.69$ seconds represents
+assumed busy stage service. Dividing by $0.977$ adds the modeled idle
+fraction. With $D=1$, there is no DP synchronization tail to add.
+The middle stages have two neighbors: using one boundary allowance
+requires enough overlap or link concurrency that the second boundary
+does not add another full serial cost. If both boundary costs are
+exposed, charge both to those stages and recompute their service times.
+The $52.5$-second result is consequently neither a guaranteed upper
+bound nor a lower bound.
 
 This is a screening estimate, not a promised runtime. Attention FLOPs,
 optimizer work, imperfect stage balance, input stalls, and checkpoint I/O are
@@ -1009,6 +1252,13 @@ T_{\mathrm{train}}
 \end{aligned}
 $$
 
+**Derivation.** A fixed token budget requires approximately $P/(BS)$
+updates. Multiplying that count by seconds per update gives
+$PT_{\mathrm{step}}/(BS)$. This is equivalent to dividing $P$ by the
+throughput $BS/T_{\mathrm{step}}$. Divide seconds by 86,400 to get days,
+then by 365 to get approximate years. This assumes the token rate
+persists throughout training and excludes checkpoint/recovery pauses.
+
 Even the compute-only lower bound is sobering:
 
 $$
@@ -1018,6 +1268,16 @@ T_{\mathrm{compute\ lower\ bound}}
 {32\times150\times10^{12}}
 \approx1{,}013\ \mathrm{days}.
 $$
+
+**Why the batch disappears.** Compute per update is approximately
+$6NBS$, while the number of updates is $P/(BS)$. Multiplying cancels
+$BS$, leaving $6NP$ total FLOPs. Batch and microbatch still affect
+kernel efficiency, optimizer overhead, and pipeline occupancy; they
+do not change this parameter-matmul work count for a fixed token budget.
+The “lower bound” is relative to the assumed sustained compute rate
+and omitted overheads, not an absolute hardware limit. Recomputing
+activations adds FLOPs; if the quoted compute rate measures executed
+kernel FLOPs, those extra FLOPs must be included explicitly.
 
 Therefore 32 GPUs may make the model **memory-feasible**, while full pretraining
 remains **schedule- and cost-impractical**. For a limited-GPU project, the
@@ -1046,6 +1306,14 @@ M_{\mathrm{checkpoint}}
 =0.98\ \mathrm{TB}.
 $$
 
+**Why 14 rather than 16?** The 2-byte gradient buffer was needed while
+training but is excluded from this step-boundary checkpoint. The
+assumed stored arrays retain 2-byte weights, 4-byte master weights,
+and two 4-byte moments. Multiply 14 bytes by parameter count. Other
+checkpoint schemas can omit reconstructible arrays; an exact restart
+also needs optimizer step, random-generator, scheduler, and data-position
+state, assumed small relative to these arrays.
+
 If the storage path sustains an aggregate $10\ \mathrm{GB/s}$, the
 transfer-only lower bound is:
 
@@ -1054,6 +1322,13 @@ T_{\mathrm{checkpoint}}
 \ge\frac{0.98\ \mathrm{TB}}{10\ \mathrm{GB/s}}
 =98\ \mathrm{s}.
 $$
+
+**Derivation.** Even with zero serialization overhead, the storage path
+must carry 980 GB. At 10 GB each second, that requires 98 seconds.
+This assumes that rate is the aggregate bottleneck bandwidth, not a
+per-rank bandwidth accidentally multiplied by every writer. The
+inequality applies when 10 GB/s is a ceiling; if it is merely an
+assumed average, 98 seconds is a transfer-time estimate.
 
 A blocking checkpoint every 30 minutes would spend at least
 $98/1800\approx5.4\%$ of wall time writing, before metadata and contention.
@@ -1154,6 +1429,21 @@ f_{\mathrm{overhead}}
 +\underbrace{\frac{\tau}{2J}}_{\text{expected lost work}}
 +\underbrace{\frac{r}{J}}_{\text{restart}}.
 $$
+
+**Derivation over a long run.** Consider $H$ seconds of useful training.
+There are approximately $H/\tau$ checkpoint writes, each costing $c$,
+so write overhead divided by $H$ is $c/\tau$. With rare failures,
+there are approximately $H/J$ failures. A failure uniformly located
+between checkpoints loses between zero and $\tau$ seconds of work,
+averaging $\tau/2$. Lost work divided by $H$ is therefore $\tau/(2J)$.
+Each failure also costs $r$ seconds to restart, giving $r/J$.
+
+All three terms are dimensionless. They add because this model charges
+them as separate, nonoverlapping costs. Shortening $\tau$ increases
+checkpoint frequency but decreases expected lost work. The expression
+is a first-order overhead estimate: if overhead relative to useful
+time is $f$, its wall-time fraction is $f/(1+f)$, approximately $f$
+only when overhead is small.
 
 The estimate ignores overlapping checkpoints and correlated failures. For
 example, $c=20\ \mathrm{s}$, $\tau=1200\ \mathrm{s}$,
