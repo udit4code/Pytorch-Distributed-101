@@ -54,7 +54,7 @@ gradient before it updates its own model replica.
 Make sure PyTorch is installed in the active Python environment, then run:
 
 ```bash
-torchrun --standalone --nproc-per-node=4 -m phase3.all_reduce_demo
+GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.all_reduce_demo
 ```
 
 Each process prints a JSON record before and after AllReduce. In the records
@@ -68,8 +68,7 @@ The integration test launches a real `torchrun` subprocess; it does not mock
 `torch.distributed`. From the repository root, run:
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q \
-  tests/test_all_reduce.py::test_all_reduce_demo_returns_expected_sum_on_every_rank
+RUN_DISTRIBUTED=1 python -m pytest -q tests/test_all_reduce.py::test_all_reduce_demo_returns_expected_sum_on_every_rank
 ```
 
 This test checks that the command exits successfully, observes output from all
@@ -111,11 +110,36 @@ each replica before the local optimizer step. AllReduce matches that shape.
 
 ## 5. Gradient averaging
 
-AllReduce SUM yields `sum(g_r for r = 0..P-1)`. Divide by world size to obtain the mean
-when ranks process equally sized local batches and local losses are means.
-Why is averaging necessary to match a mean loss on the concatenated global
-batch? Would it still be correct if ranks processed different numbers of
-examples? Explain your assumptions before coding.
+First define what each rank has computed. Let rank `r` process `n_r` examples,
+and let `grad_(r,i)` be the gradient from its `i`th example. If each rank's
+loss is the mean over its local examples, its local gradient is also a mean:
+
+```text
+g_r = (grad_(r,1) + grad_(r,2) + ... + grad_(r,n_r)) / n_r
+```
+
+### Equal local batch sizes
+
+Suppose there are `P` ranks and every rank processes the same number `n` of
+examples. The global batch contains `P * n` examples. Its mean gradient is
+the sum of all per-example gradients divided by `P * n`:
+
+```text
+g_global
+  = (sum of every rank's per-example gradients) / (P * n)
+  = (g_0 + g_1 + ... + g_(P-1)) / P
+```
+
+So the implementation has two steps: AllReduce SUM the rank-local mean
+gradients, then divide the result by `P` (the world size). Every rank receives
+the same average. This matches the gradient from one process computing mean
+loss over the concatenated global batch. Averaging is necessary because a SUM
+would be `P` times larger and would change the SGD update size for the same
+learning rate.
+
+This equal-rank average assumes equal local sample counts and mean-reduced
+local losses. Before implementing it, predict what happens if those assumptions
+do not hold.
 
 ### Paper-and-pencil derivation 1: equal batches
 
@@ -133,30 +157,47 @@ needs the same gradient.
 
 ## 6. Unequal local batches
 
-If rank `r` processes `n_r` examples and computes a local **mean** gradient,
-then that gradient is
+If local sample counts differ, each rank's mean represents a different number
+of examples. Give each local mean gradient weight proportional to its count.
+For rank `r`, multiply its local mean by `n_r` to recover its local sum:
 
-`g_r = (1 / n_r) * sum(grad_theta(loss_(r,i)) for i = 1..n_r)`.
+```text
+local_gradient_sum_r = n_r * g_r
+```
 
-Therefore, `n_r * g_r` is the sum of its per-example gradients. Add those sums
-across ranks and divide by the total number of examples to get the global mean:
+Sum these local gradient sums across ranks, then divide by the total number of
+examples:
 
-`g_global = sum(n_r * g_r for r = 0..P-1) / sum(n_r for r = 0..P-1)`
+```text
+g_global
+  = sum(n_r * g_r for r = 0..P-1) / sum(n_r for r = 0..P-1)
+```
 
-Equivalently, `g_global` is the sum of all per-example gradients divided by
-the total number of examples.
+For example, say four ranks process `4, 8, 2, and 6` examples. Suppose their
+local mean gradients (shown here as scalars for easy arithmetic) are `1, 2, 3,
+and 8`. Then:
 
-For 2 and 8 samples, explain why the unweighted mean of `g_0` and `g_1` gives the two ranks equal
-weight rather than the examples equal weight. The count-weighted expression
-gives each example equal weight. If a rank has zero examples, it contributes
-zero to both the gradient sum and sample count; the global total must still be
-positive. Implement weighted aggregation.
+```text
+weighted sum = 4*1 + 8*2 + 2*3 + 6*8 = 86
+sample count = 4 + 8 + 2 + 6 = 20
+global mean gradient = 86 / 20 = 4.3
+```
+
+The unweighted rank mean would be `(1 + 2 + 3 + 8) / 4 = 3.5`, which is
+different because it gives each rank equal weight instead of each example
+equal weight. In code, AllReduce the weighted gradient sums and AllReduce the
+sample counts, then divide the former by the latter. Both collectives must be
+called by every rank in the same order.
+
+An empty rank contributes a zero gradient sum and count zero. Its local mean
+gradient is undefined, so use a zero tensor for its contribution. The total
+sample count across the process group must still be positive.
 
 ### Paper-and-pencil derivation 2
 
-Starting from `g_r = (sum of rank r's per-example gradients) / n_r`, derive
-the weighted formula without looking above. State how you would handle a rank with
-zero examples and what to do if the global sample count is zero.
+Without looking above, derive the weighted formula from the definition of each
+rank's local mean. Explain why an empty rank contributes zero and why a globally
+empty batch must be rejected.
 
 ## 7. Manual AllReduce
 
@@ -225,16 +266,14 @@ Run both methods on four real processes and compare each result against native
 AllReduce:
 
 ```bash
-torchrun --standalone --nproc-per-node=4 \
-  -m phase3.manual_all_reduce --self-check
+GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.manual_all_reduce --self-check
 ```
 
 Each rank prints a JSON record with `"phase": "passed"` if both manual
 results equal `[10, 100]`. The focused pytest integration test is:
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q \
-  tests/test_manual_all_reduce.py::test_manual_reduce_broadcast_and_point_to_point_match_native
+RUN_DISTRIBUTED=1 python -m pytest -q tests/test_manual_all_reduce.py::test_manual_reduce_broadcast_and_point_to_point_match_native
 ```
 
 Do not call Reduce, Broadcast, or AllReduce inside the point-to-point function;
