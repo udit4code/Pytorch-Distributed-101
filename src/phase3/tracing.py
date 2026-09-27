@@ -10,7 +10,25 @@ from typing import Iterator
 def trace_event(name: str, rank: int) -> Iterator[None]:
     """Print start/end timestamps around a named local event.
 
-    TODO: IMPLEMENT: emit flushed, rank-tagged start and end records with
-    monotonic timestamps even if the enclosed operation raises; re-raise errors.
+    Emits flushed, rank-tagged start/end records using monotonic timestamps.
+    The timestamps and duration describe this process's local timing; do not
+    treat monotonic timestamps as synchronized wall-clock times across hosts.
+    Exceptions from the enclosed block are not swallowed.
     """
-    raise NotImplementedError
+    start = time.monotonic()
+
+    print(
+        f"rank={rank} event={name} phase=start ts={start:.9f}",
+        flush=True,
+    )
+
+    try:
+        yield
+    finally:
+        end = time.monotonic()
+
+        print(
+            f"rank={rank} event={name} phase=end ts={end:.9f} "
+            f"duration={end - start:.9f}",
+            flush=True,
+        )
