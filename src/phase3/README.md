@@ -11,9 +11,9 @@ Every rank has its own model replica and independently runs `optimizer.step()`.
 So every rank needs the same aggregate gradient: the communication shape is
 many-to-everyone. That is exactly the result AllReduce provides.
 
-This phase intentionally leaves the learning-critical operations unfinished.
-Each exercise function has a detailed `TODO: IMPLEMENT` comment; its tests
-specify behavior and should fail until the corresponding exercise is done.
+This phase builds from a working AllReduce demonstration to a complete manual
+data-parallel SGD example. The notes explain the ideas and show how to run the
+implementations and their distributed tests.
 
 ## Start here: a live four-process AllReduce
 
@@ -77,9 +77,9 @@ installed in the active environment, install it with `python -m pip install
 pytest` and retry. A normal `python -m pytest` run skips tests marked as real
 distributed integration tests unless `RUN_DISTRIBUTED=1` is set.
 
-The remaining Phase 3 exercises are intentionally unfinished. Their tests
-describe expected behavior, but those tests are expected to fail until you
-implement the corresponding TODOs.
+The sections that follow explain the collective semantics, gradient
+aggregation, distributed training, and the failure and performance behaviors
+demonstrated by the code.
 
 ## 1. Goal
 
@@ -738,12 +738,3 @@ Answer these without looking at code:
 - How should aggregation change for different local batch sizes?
 - Why is distributed sampling a correctness concern as well as a performance choice?
 
-## Definition of done
-
-Without DDP, implement `torchrun → identical replicas → different local
-minibatches → forward/backward → AllReduce → identical global gradients →
-optimizer.step() → identical replicas`. Numerically prove that one process on a
-global batch and `P` processes on equivalent local batches produce the same
-SGD update under matching assumptions. The key reasoning is mathematical:
-synchronous replicated SGD requires each rank to obtain the same aggregate
-gradient, and AllReduce has precisely those semantics.
