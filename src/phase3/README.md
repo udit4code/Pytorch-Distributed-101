@@ -138,22 +138,46 @@ would be `P` times larger and would change the SGD update size for the same
 learning rate.
 
 This equal-rank average assumes equal local sample counts and mean-reduced
-local losses. Before implementing it, predict what happens if those assumptions
-do not hold.
+local losses. When sample counts differ, use the count-weighted derivation below.
 
-### Paper-and-pencil derivation 1: equal batches
+### Derivation 1: global-batch gradient for equal local batches
 
-For two equally sized local batches, each local mean gradient gives every
-example within that batch weight `1 / |B_0|`. Since the global batch has twice
-as many examples, each local mean contributes half of the global mean:
+Let each of two ranks process `n` examples. For an example `i`, write its loss
+as `ell_i` and its gradient as `grad_i`. The mean loss on the concatenated
+batch is
 
-`g_global = grad(L_(B_0 union B_1)) = (grad(L_B0) + grad(L_B1)) / 2 = (g_0 + g_1) / 2`.
+```text
+L_global = (sum(ell_i over B_0) + sum(ell_i over B_1)) / (2*n)
+```
 
-For `P` equal-sized rank-local batches, generalize this to
-`g_global = (1 / P) * sum(g_r for r = 0..P-1)`.
+Regroup the two sums by dividing each by `n`:
 
-Then draw four replicas each calling `optimizer.step()` and explain why each
-needs the same gradient.
+```text
+L_global
+  = (1/2) * [ (sum(ell_i over B_0) / n)
+            + (sum(ell_i over B_1) / n) ]
+  = (L_0 + L_1) / 2
+```
+
+Differentiation is linear, so differentiating this equality gives
+
+```text
+grad(L_global) = (grad(L_0) + grad(L_1)) / 2 = (g_0 + g_1) / 2
+```
+
+For `P` ranks with the same local batch size `n`, the global batch has `P*n`
+examples. Repeating the same regrouping gives
+
+```text
+L_global = (L_0 + L_1 + ... + L_(P-1)) / P
+g_global = (g_0 + g_1 + ... + g_(P-1)) / P
+```
+
+AllReduce SUM gives every rank the numerator; dividing by `P` gives every
+rank `g_global`. Every replica needs it because each process owns its own
+parameters and optimizer and will independently run `optimizer.step()`. If
+only rank 0 received the sum, the other ranks would step with stale or local
+gradients and their model copies would diverge.
 
 ## 6. Unequal local batches
 
@@ -212,11 +236,39 @@ same worker check directly, use:
 GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.gradient_sync --self-check
 ```
 
-### Paper-and-pencil derivation 2
+### Derivation 2: global-batch gradient for unequal local batches
 
-Without looking above, derive the weighted formula from the definition of each
-rank's local mean. Explain why an empty rank contributes zero and why a globally
-empty batch must be rejected.
+Suppose rank `r` has `n_r` examples and computes a local mean gradient:
+
+```text
+g_r = (1 / n_r) * sum(grad_(r,i) for i = 1..n_r)
+```
+
+Multiply both sides by `n_r`; this recovers that rank's sum of per-example
+gradients:
+
+```text
+n_r * g_r = sum(grad_(r,i) for i = 1..n_r)
+```
+
+The global mean includes every example once, then divides by the total example
+count. Substituting the local sums gives
+
+```text
+g_global
+  = [sum over ranks of (n_r * g_r)] / [sum over ranks of n_r]
+```
+
+For example, with 2 examples on rank 0 and 8 on rank 1, suppose their local
+mean gradients are `g_0 = 2` and `g_1 = 8`. The correct example-weighted result
+is `(2*2 + 8*8) / (2+8) = 68/10 = 6.8`. The unweighted rank mean is
+`(2+8)/2 = 5`, which gives a rank with 2 examples the same influence as the
+rank with 8 examples.
+
+An empty rank has no defined local mean. Treat its contribution as a zero
+gradient sum and a sample count of zero. The global denominator must be
+positive; if every rank is empty, the global mean is undefined and the step
+must be rejected.
 
 ## 7. Manual AllReduce
 
@@ -322,15 +374,71 @@ buffers; consider what a model with mutable buffers would require.
 Build the deterministic regression dataset and MLP. Each rank gets a distinct
 shard, computes local mean loss and gradients, AllReduces each present gradient,
 divides by world size for equal shard sizes, and calls plain SGD. No DDP hooks.
+
+### A hand-worked two-rank update
+
+First reduce the protocol to one parameter, `w`, and one example per rank. Both
+replicas start with `w = 0`, use squared error, and use learning rate `0.1`:
+
+```text
+rank 0 has (x=1, target=2): loss = (w*x - target)^2
+rank 1 has (x=2, target=0): loss = (w*x - target)^2
+```
+
+For one squared-error example, the gradient with respect to `w` is
+`2 * (w*x - target) * x`. At `w = 0`:
+
+```text
+rank 0 gradient = 2 * (0*1 - 2) * 1 = -4
+rank 1 gradient = 2 * (0*2 - 0) * 2 =  0
+```
+
+AllReduce SUM gives `-4` to both ranks. The local batches have equal size, so
+divide by two: both ranks now have gradient `-2`. Each replica applies the same
+SGD update:
+
+```text
+w_new = w - learning_rate * gradient
+      = 0 - 0.1 * (-2)
+      = 0.2
+```
+
+The single-process mean loss over those same two examples has gradient `-2`
+at `w=0`, so it also updates `w` to `0.2`. Without gradient synchronization,
+rank 0 would update to `0.4` while rank 1 would remain at `0`; the replicas
+would diverge immediately. This small calculation is the same sequence used by
+the MLP below, where each gradient tensor has many elements instead of one.
+
+### Run the four-rank MLP example
+
+The dataset has 16 examples. Rank 0 takes rows 0–3, rank 1 takes rows 4–7,
+rank 2 takes rows 8–11, and rank 3 takes rows 12–15. Each local loss is a mean
+over four examples. The per-parameter AllReduce SUM followed by division by
+four produces the gradient of the mean loss over all 16 examples.
+
 Run with:
 
 ```bash
-torchrun --standalone --nproc-per-node=4 -m phase3.distributed_sgd
+GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 3 --self-check
 ```
 
-`--sync-gradients=false` is an experiment: identical initial replicas see
-different data, step on different gradients, and diverge. Parameter consistency
-is checked every training step.
+Every run checks replica equality after each step. With `--self-check`, it also
+fails if the distributed parameters differ from rank 0's single-process
+reference trained on the full 16-example batch. Rank 0 emits one JSON record
+per step, including loss, batch sizes, and maximum parameter differences.
+
+The opt-in integration test runs the same comparison and checks its output:
+
+```bash
+RUN_DISTRIBUTED=1 python -m pytest -q tests/test_distributed_sgd.py::test_one_and_multiple_steps_match_reference_and_stay_synchronized
+```
+
+`--sync-gradients=false` is a separate experiment: identical initial replicas
+see different data, step on different gradients, and diverge. Verify that with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 1 --sync-gradients=false
+```
 
 ## 11. Correctness against single-process SGD
 
@@ -340,10 +448,27 @@ stepping within a stated floating-point tolerance. This equivalence assumes the
 same initial parameters, examples, loss reduction, optimizer, learning rate,
 and update timing. Data placement changes; the mathematical update should not.
 
-### Paper-and-pencil derivation 3
+### Derivation 3: why every replica needs the aggregate
 
-Explain why Reduce alone cannot provide the needed result to four independent
-replicas. What changes if a rank has zero samples, or if loss reduction is sum?
+Start from the local SGD update on rank `r`:
+
+```text
+theta_r_after = theta_r_before - learning_rate * gradient_r
+```
+
+The replicas start with the same parameters. To keep them equal after the
+step, they must apply the same update, which requires the same aggregate
+gradient on every rank. Reduce sends the aggregate to only one destination;
+the other replicas cannot apply that global update from the Reduce result.
+AllReduce returns the aggregate to every participant, so each independent
+optimizer can make the same update.
+
+If a rank has zero samples, it contributes a zero gradient **sum** and count
+zero. Weighting by sample counts still works as long as the total count is
+positive. If local losses use SUM rather than MEAN reduction, the local
+gradient is already a gradient sum: AllReduce those sums and divide by the
+global sample count to recover the global mean. Do not multiply a local sum by
+its sample count again.
 
 ## 12. Communication cost
 
@@ -397,9 +522,17 @@ replicas after each step and compare to the single-process reference on the
 same effective global batches. Rank 0 emits one JSON training record per step,
 including global loss, world size, local batch size, and global batch size.
 
-Exercise 16: for world size 8, local batch size 16, and 4 accumulation steps,
-derive the effective global batch size. Relate the result to how often the
-gradient is averaged; accumulation implementation is an optional extension.
+Exercise 16 worked derivation: with world size `8`, local batch size `16`, and
+`4` microbatches accumulated before each optimizer step, each rank contributes
+`16 * 4 = 64` examples to one update. Across all ranks, the effective global
+batch size is `8 * 16 * 4 = 512` examples. For the global mean gradient, each
+rank must accumulate its four microbatch gradient sums (or equivalently
+appropriately scaled means); workers then combine rank contributions and
+normalize by the total of 512 examples. With equal local batches and correctly
+mean-scaled accumulated gradients, AllReduce SUM followed by division by
+world size gives the same mean. Accumulation changes how many local examples
+contribute before a step; it does not remove the need for cross-rank gradient
+synchronization.
 
 ## 18. Senior MLE interview checkpoint
 
