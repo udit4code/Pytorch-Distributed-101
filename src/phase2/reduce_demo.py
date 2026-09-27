@@ -12,8 +12,7 @@ def run(dst: int = 0, operator: str = "SUM") -> None:
         tensor = torch.tensor([rank + 1, (rank + 1) * 10], dtype=torch.int64)
         op = getattr(dist.ReduceOp, operator)
         rank_record(rank, "reduce", tensor, phase="before", dst=dst, reduce_op=operator)
-        # TODO: IMPLEMENT dist.reduce(tensor, dst=dst, op=op).
-        raise NotImplementedError
+        dist.reduce(tensor=tensor, dst=dst, op=op)
         if rank == dst:
             rank_record(rank, "reduce", tensor, phase="after", dst=dst, reduce_op=operator)
     finally:

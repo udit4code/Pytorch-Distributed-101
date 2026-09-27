@@ -212,18 +212,179 @@ Try `SUM`, `MAX`, `MIN`, and `PRODUCT` where backend/dtype supports them. For `1
 
 ## 7. Manual reduction
 
-Complete `manual_reduce_sum` with point-to-point messages. Every rank starts with local data; the destination receives and accumulates contributions. Then complete `tree_reduce_sum` for destination zero and power-of-two world size:
+`manual_reduce` and `tree_reduce` implement reduction using point-to-point
+messages. Both default to `SUM` and also accept `MAX`, `MIN`, and `PRODUCT`.
+The older `manual_reduce_sum` and `tree_reduce_sum` names remain as SUM-only
+wrappers. Every rank must use the same operator, tensor shape, and dtype.
+
+For four ranks containing `[1]`, `[2]`, `[3]`, and `[4]`:
+
+| Operator | Destination result | Elementwise combine |
+|---|---:|---|
+| `SUM` | `[10]` | `accumulator + incoming` |
+| `MAX` | `[4]` | larger corresponding value |
+| `MIN` | `[1]` | smaller corresponding value |
+| `PRODUCT` | `[24]` | `accumulator * incoming` |
+
+These operators are associative, so partial results may be grouped into a tree.
+Integer PRODUCT can overflow for large values, and backend/dtype support should
+always be checked when using native collectives.
+
+### Direct SUM dry run: four-rank execution
+
+Suppose each rank starts with `rank + 1` and the destination is rank zero:
 
 ```text
-Round 1: R1 -> R0 (1+2=3), R3 -> R2 (3+4=7)
-Round 2: R2 -> R0 (3+7=10)
+R0=[1]  R1=[2]  R2=[3]  R3=[4]
 ```
 
-The communication logic and accumulation are intentionally TODOs. Compare code complexity, explicit message count, synchronization reasoning, scalability, maintainability, and algorithm/backend optimization opportunities with native collectives. This is a semantic comparison, not a Mac networking benchmark.
+All four processes call the same function, but their `rank` makes them follow
+different branches:
+
+| Execution step | Rank behavior | Destination accumulator |
+|---:|---|---:|
+| 1 | R0 clones its local `[1]` into `result` | `[1]` |
+| 2 | Loop reaches source 0; R0 skips receiving from itself | `[1]` |
+| 3 | R1 sends `[2]`; R0 receives it and runs `result.add_([2])` | `[3]` |
+| 4 | R2 sends `[3]`; R0 receives and adds it | `[6]` |
+| 5 | R3 sends `[4]`; R0 receives and adds it | `[10]` |
+| 6 | R0 copies `result` back into its input tensor | `[10]` |
+
+Ranks 1, 2, and 3 return after their blocking sends complete. Their local
+tensors remain `[2]`, `[3]`, and `[4]` in this implementation, but reduce
+semantics only guarantee the final result at the destination.
+
+Run this example with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29650 \
+  -m phase2.manual_reduce \
+  --algorithm manual \
+  --operator SUM \
+  --dst 0
+```
+
+The CLI enables a detailed trace by default. Each line begins with the rank and
+shows when it waits, sends, receives, updates its accumulator, or finishes.
+Because workers write concurrently, lines from different ranks can appear in a
+different order between runs. Add `--quiet` when only the structured
+before/after records are needed.
+
+### Tree SUM dry run: eight-rank execution
+
+The tree version currently requires destination zero and a power-of-two world
+size. With rank-local values `[1]` through `[8]`, every active receiver holds a
+partial sum. A sender transfers its partial sum exactly once and then exits the
+loop so its contribution cannot be counted again.
+
+```text
+Initial: R0=1 R1=2 R2=3 R3=4 R4=5 R5=6 R6=7 R7=8
+
+step=1: R1 -> R0, R3 -> R2, R5 -> R4, R7 -> R6
+        R0=3,       R2=7,       R4=11,      R6=15
+
+step=2: R2 -> R0, R6 -> R4
+        R0=10,      R4=26
+
+step=4: R4 -> R0
+        R0=36
+```
+
+Here is how the loop condition produces those pairs:
+
+| `step` | Sender condition | Senders | Destinations | Partial sums afterward |
+|---:|---|---|---|---|
+| 1 | `rank % 2 == 1` | 1, 3, 5, 7 | 0, 2, 4, 6 | R0=3, R2=7, R4=11, R6=15 |
+| 2 | `rank % 4 == 2` | 2, 6 | 0, 4 | R0=10, R4=26 |
+| 4 | `rank % 8 == 4` | 4 | 0 | R0=36 |
+
+Trace rank 6 through the code: at `step=1`, it is a receiver, calculates
+`source=7`, receives `[8]`, and changes its tensor from `[7]` to `[15]`. At
+`step=2`, `6 % 4 == 2`, so it sends `[15]` to rank 4 and breaks. Rank zero
+never becomes a sender; it receives and accumulates at every round until it
+holds `[36]`.
+
+Run the eight-rank tree example with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=8 \
+  --master-addr=127.0.0.1 \
+  --master-port=29651 \
+  -m phase2.manual_reduce \
+  --algorithm tree \
+  --operator SUM \
+  --dst 0
+```
+
+For the tree run, the trace also prints the round number, `step`, partner rank,
+payload, updated partial sum, and the point where each sender leaves the tree.
+
+To try another operator, keep the same topology and change only `--operator`:
+
+```bash
+# Four ranks reduce [1], [2], [3], [4] to MAX=[4] at rank 2.
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29654 \
+  -m phase2.manual_reduce \
+  --algorithm manual \
+  --operator MAX \
+  --dst 2
+```
+
+Omitting `--operator` selects `SUM`.
+
+### What complexity improves?
+
+Let `P` be the number of ranks and `N` the tensor size.
+
+| Property | Direct reduction | Tree reduction |
+|---|---:|---:|
+| Sequential communication depth | `P - 1`, or `O(P)` | `log2(P)`, or `O(log P)` |
+| Total messages | `P - 1`, or `O(P)` | `P - 1`, or `O(P)` |
+| Total tensor data transferred | `(P - 1) * N`, or `O(PN)` | `(P - 1) * N`, or `O(PN)` |
+| Receives/combine operations performed by root | `P - 1` | `log2(P)` |
+
+For eight ranks, direct reduction makes the destination receive seven tensors
+sequentially. The tree needs three rounds because `log2(8) = 3`. Under an ideal
+model where independent pairs communicate concurrently, the critical-path
+communication changes from approximately
+`(P - 1) * (latency + N / bandwidth)` to
+`log2(P) * (latency + N / bandwidth)`.
+
+The total message count and total bytes do not improve: both algorithms still
+send seven tensors for eight ranks. The tree improves communication depth and
+distributes the selected combine operation and network work across ranks.
+Actual speedup depends on whether the hardware can run the same-round transfers
+concurrently; ranks on one laptop often compete for shared CPU and memory
+bandwidth.
 
 ## 8. Barrier
 
 `dist.barrier()` makes each member wait until all members of its group reach that point. It does not copy tensors or make Python objects identical. `barrier_demo.py` delays ranks by 0, 1, 2, and 4 seconds and records before/after timestamps and wait duration. Predict when the fastest rank proceeds. A slow worker can make every faster worker idle at a synchronization point: the straggler problem.
+
+Run the four-rank barrier demonstration from the repository root:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29670 \
+  -m phase2.barrier_demo
+```
+
+On Linux, replace `GLOO_SOCKET_IFNAME=lo0` with
+`GLOO_SOCKET_IFNAME=lo`. Rank zero arrives first and should wait roughly four
+seconds, while rank three arrives last and should wait very little.
 
 ## 9. Synchronization vs communication
 
