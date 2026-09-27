@@ -392,7 +392,73 @@ Broadcast and reduce move/transform application data. Barrier establishes a coor
 
 ## 10. Process groups
 
-The default world is one group; `dist.new_group` creates other membership sets. Complete `create_pair_groups()` and subgroup broadcast for `{0,1}` and `{2,3}`. All world ranks must create groups in compatible order, while only members call a subgroup collective. Group A's barrier does not require ranks 2 and 3. Smaller groups later support communication among selected tensor, pipeline, or expert parallel workers.
+### Why have groups when WORLD already exists?
+
+Start with four independent processes launched by `torchrun`. After
+`dist.init_process_group`, each process has a unique global rank and all four
+belong to the default group, `WORLD`:
+
+```text
+WORLD = {R0, R1, R2, R3}
+```
+
+A collective is defined over a group. If these ranks call a WORLD broadcast,
+all four must participate and all four receive the same source value. That is
+correct when the operation concerns the entire job, but many distributed
+algorithms need communication among only selected workers.
+
+For example, suppose R0/R1 are one data-parallel replica and R2/R3 are another:
+
+```text
+WORLD   = {R0, R1, R2, R3}  # setup, global coordination, global rank space
+Group A = {R0, R1}          # one independent collective sequence
+Group B = {R2, R3}          # another independent collective sequence
+```
+
+Using WORLD for the pair broadcasts would couple unrelated ranks: R2 and R3
+would have to enter R0's broadcast, and one WORLD broadcast could not deliver
+100 to the first pair while independently delivering 200 to the second pair.
+The two subgroups provide separate participation scopes. A collective on Group
+A requires only R0 and R1; R2 and R3 do not call it or wait for it.
+
+Process groups do not create processes, share Python memory, or automatically
+choose a physical network topology. They define which existing ranks
+participate in a collective and provide the communication context in which
+collective ordering must agree. WORLD remains useful as the initial group and
+global rank namespace from which smaller groups are created.
+
+### Pair-group assumptions and execution
+
+This exercise intentionally assumes exactly four world ranks. Every world rank
+calls `dist.new_group([0, 1])` and then `dist.new_group([2, 3])` in the same
+order. Consistent creation order ensures that all processes agree about the two
+communication contexts. After creation, each rank calls a broadcast only on
+the group to which it belongs.
+
+The `src` argument is a global rank even when `group` limits participation:
+
+| Rank | Subgroup | Initial tensor | Subgroup source | Final tensor |
+|---:|---|---:|---:|---:|
+| 0 | A `{0,1}` | `[100]` | R0 | `[100]` |
+| 1 | A `{0,1}` | `[-1]` | R0 | `[100]` |
+| 2 | B `{2,3}` | `[200]` | R2 | `[200]` |
+| 3 | B `{2,3}` | `[-1]` | R2 | `[200]` |
+
+Run the logged demonstration with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29680 \
+  -m phase2.process_groups
+```
+
+On Linux, use `GLOO_SOCKET_IFNAME=lo`. The logs show WORLD initialization,
+group membership, source ranks, and tensors before and after each subgroup
+broadcast. In larger training systems, groups commonly represent data,
+tensor, pipeline, or expert-parallel communication scopes.
 
 ## 11. Collective ordering
 
