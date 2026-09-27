@@ -35,6 +35,26 @@ def run_torchrun(module: str, nproc: int, *args: str, timeout: int = 30):
     )
 
 
+def _json_records(output: str) -> list[dict[str, object]]:
+    """Decode JSON objects even when workers' stdout writes are adjacent."""
+    decoder = json.JSONDecoder()
+    records = []
+    position = 0
+    while position < len(output):
+        start = output.find("{", position)
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(output, start)
+        except json.JSONDecodeError:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+        position = end
+    return records
+
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_DISTRIBUTED") != "1",
     reason="set RUN_DISTRIBUTED=1 to run real torchrun tests",
@@ -104,9 +124,8 @@ def test_blocking_and_nonblocking_timestamps_follow_local_event_order():
     result = run_torchrun("phase1.async_comm", 2, "--scenario", "timings")
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        json.loads(line)
-        for line in result.stdout.splitlines()
-        if line.startswith("{") and '"blocking_communication_start"' in line
+        record for record in _json_records(result.stdout)
+        if "blocking_communication_start" in record
     ]
     assert {record["rank"] for record in records} == {0, 1}, result.stdout
     for record in records:
@@ -129,9 +148,8 @@ def test_blocking_and_nonblocking_timestamps_follow_execution_order():
     result = run_torchrun("phase1.async_comm", 2, "--scenario", "timings")
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        json.loads(line)
-        for line in result.stdout.splitlines()
-        if line.startswith("{") and '"blocking_communication_start"' in line
+        record for record in _json_records(result.stdout)
+        if "blocking_communication_start" in record
     ]
     assert {record["rank"] for record in records} == {0, 1}, result.stdout
     for record in records:

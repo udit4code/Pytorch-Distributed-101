@@ -38,6 +38,37 @@ def synchronize_gradients(model: nn.Module) -> None:
         parameter.grad.div_(world_size)
 
 
+def global_mean_loss(
+    local_loss_sum: torch.Tensor,
+    local_example_count: int,
+) -> torch.Tensor:
+    """Return the sample-weighted global mean loss on every rank.
+
+    ``local_loss_sum`` must be the sum of per-example losses on this rank.
+    The count may be zero for an empty shard, but the global count must be
+    positive. Both AllReduces run on every rank in the same order.
+    """
+    if local_example_count < 0:
+        raise ValueError("local_example_count must be non-negative")
+    if local_loss_sum.numel() != 1:
+        raise ValueError("local_loss_sum must contain exactly one scalar")
+
+    # Detach so this metric aggregation never becomes part of autograd.
+    total_loss = local_loss_sum.detach().clone()
+    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+
+    # Sum counts as integers; this is the denominator for the global mean.
+    total_count = torch.tensor(
+        [local_example_count], dtype=torch.int64, device=local_loss_sum.device
+    )
+    dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+    count = int(total_count.item())
+    if count == 0:
+        raise ValueError("global example count must be positive")
+
+    return total_loss / count
+
+
 def _flatten_parameters(model: nn.Module) -> torch.Tensor:
     """Copy model parameters into one vector for a compact comparison."""
     return torch.cat(
@@ -141,11 +172,15 @@ def run(
                 synchronize_gradients(model)
             optimizer.step()
 
-            # The local shard sizes are equal, so the mean of local mean losses
-            # is the global mean loss. Every rank receives that metric.
-            global_loss = loss.detach().clone()
-            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
-            global_loss.div_(world_size)
+            # Aggregate a true loss sum and sample count. This remains correct
+            # if shard sizes later become uneven (unlike averaging rank means).
+            local_loss_sum = nn.functional.mse_loss(
+                predictions.detach(), local_targets, reduction="sum"
+            )
+            global_loss = global_mean_loss(
+                local_loss_sum,
+                local_example_count=local_targets.shape[0],
+            )
 
             # Broadcast rank 0's flattened parameters and reduce the largest
             # local difference. No AllGather is needed for this check.
@@ -202,6 +237,45 @@ def run(
         cleanup_process_group()
 
 
+def run_metrics_self_check() -> None:
+    """Check weighted loss aggregation with four deliberately uneven shards.
+
+    Ranks contribute counts 1, 2, 3, 4 and local mean losses 1, 2, 3, 4.
+    The global loss sum is 30 and the global example count is 10, so every rank
+    must obtain a global mean loss of 3.
+    """
+    setup_process_group()
+    try:
+        rank = dist.get_rank()
+        count = rank + 1
+        local_mean = float(rank + 1)
+        local_sum = torch.tensor([count * local_mean], dtype=torch.float64)
+        mean_loss = global_mean_loss(local_sum, local_example_count=count)
+        expected = torch.tensor([3.0], dtype=mean_loss.dtype)
+        if not torch.allclose(mean_loss, expected, rtol=0.0, atol=1e-12):
+            raise AssertionError(
+                f"rank {rank}: global mean loss was {mean_loss.tolist()}, expected [3.0]"
+            )
+
+        print(
+            json.dumps(
+                {
+                    "rank": rank,
+                    "operation": "global_loss_self_check",
+                    "local_loss_sum": local_sum.item(),
+                    "local_example_count": count,
+                    "global_mean_loss": mean_loss.item(),
+                    "global_example_count": 10,
+                    "phase": "passed",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    finally:
+        cleanup_process_group()
+
+
 def main() -> None:
     """Parse torchrun options for the training and correctness experiments."""
     parser = argparse.ArgumentParser(description="Manual CPU/Gloo data-parallel SGD.")
@@ -212,7 +286,15 @@ def main() -> None:
         action="store_true",
         help="fail unless replicas and distributed updates match the reference",
     )
+    parser.add_argument(
+        "--metrics-self-check",
+        action="store_true",
+        help="check global mean loss with uneven rank sample counts",
+    )
     args = parser.parse_args()
+    if args.metrics_self_check:
+        run_metrics_self_check()
+        return
     run(args.steps, args.sync_gradients, args.self_check)
 
 

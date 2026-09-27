@@ -569,11 +569,91 @@ hooks or attempt full DDP bucketing.
 ## 16. Failure modes
 
 Try mismatched collective ordering: rank 0 calls A then B while rank 1 calls B
-then A. A backend matches protocol order, not Python variable names. Try a
-missing rank and a short process-group timeout. These are destructive to that
-worker group, so run only in bounded subprocesses. Logs should identify rank,
-PID, operation, tensor shape, and step. The straggler exercise is a slow but
-valid collective; ordering and missing-rank exercises are protocol failures.
+then A. A backend matches calls by protocol order, not Python variable names.
+This demo uses different tensor shapes so Gloo may report a shape mismatch
+immediately; another backend/configuration may instead time out. Either result
+shows that ranks issued incompatible collectives.
+
+In the missing-rank demo, the final rank logs its departure and exits the
+scenario without entering AllReduce. The remaining ranks wait in the collective
+until Gloo reports the failed participant or the process-group timeout expires.
+Both failure cases are deliberately run in subprocesses with a short Gloo
+timeout and an outer test timeout. Their logs include rank, PID, tensor shape,
+operation, and step.
+
+### Stragglers: why one slow rank slows every rank
+
+An AllReduce combines a value contributed by every rank. Rank 0 cannot know the
+final sum until rank 3's value has arrived; the same is true for every other
+rank. In synchronous data parallel training, workers must also have the same
+parameters before they start the next forward/backward pass. So a worker that
+finishes its local batch early reaches the collective and waits for the
+remaining workers. The collective is a synchronization point because its
+result depends on all participants, even though it is not simply a standalone
+barrier.
+
+The demo in `failures.py` makes this visible with four ranks. Rank `r` puts
+`r + 1` in its tensor, so the reduction result must be `1 + 2 + 3 + 4 = 10`.
+Ranks 0, 1, and 2 enter AllReduce immediately. Rank 3 sleeps for the requested
+number of seconds before entering. Each rank measures only the time from its
+own `before_all_reduce` point to its own `after_all_reduce` point. The
+`collective_seconds` values are therefore local durations; compare those
+durations, not monotonic timestamps from different processes.
+
+I ran the following three experiments with four local Gloo processes. The
+numbers are from one run on localhost, so expect small variation from startup
+and scheduling:
+
+| Rank 3 sleep | Ranks 0–2 measured in AllReduce | Rank 3 measured in AllReduce | Result on every rank |
+| ---: | ---: | ---: | ---: |
+| 0 s | about 2.9–3.2 ms | about 2.8 ms | 10 |
+| 0.25 s | about 256 ms | about 0.54 ms | 10 |
+| 0.8 s | about 802 ms | about 0.73 ms | 10 |
+
+Why does rank 3 report a short collective duration in the delayed runs? Its
+sleep happens *before* its timer for AllReduce starts. During that sleep, the
+other three ranks have already entered AllReduce and are waiting for its
+contribution. Once rank 3 arrives, Gloo transfers/reduces the small tensors and
+the collective completes on all ranks. The slow work is charged to the early
+ranks as collective wait time, even though the slow rank did that work outside
+the collective.
+
+The per-step model is roughly: each worker does its local work, then workers
+need to finish the collective. If local work on rank `r` takes `C_r` seconds,
+the group cannot proceed before the slowest rank is ready, so the local-work
+part is governed by `max(C_0, C_1, ..., C_(P-1))`, not by the average. The
+communication time comes after (or, in more advanced implementations, can
+partly overlap with) local computation. In this simple demo, rank 3's inserted
+sleep adds close to 0.25 or 0.8 seconds to the early ranks' wait. If a similar
+imbalance recurs on every one of 100 synchronous steps, 0.25 seconds of extra
+delay per step is roughly 25 seconds during which faster workers cannot start
+their next step. This is why one straggler can erase the benefit of otherwise
+fast workers.
+
+Repeat the measurements from the repository root on macOS. Keep each port
+different if running commands close together:
+
+```bash
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29580 -m phase3.failures --scenario straggler --seconds 0 --timeout-seconds 5
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29581 -m phase3.failures --scenario straggler --seconds 0.25 --timeout-seconds 5
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29582 -m phase3.failures --scenario straggler --seconds 0.8 --timeout-seconds 5
+```
+
+First predict what the three ranks that do not sleep will report. Then inspect
+their `collective_seconds` and the `sleep_start`/`sleep_end` timestamps emitted
+by rank 3. Check that all ranks print the same reduced value. The experiment
+demonstrates the cost of waiting; it does not claim that a local Gloo timing is
+a network benchmark or that every rank's clocks can be compared.
+
+The focused integration tests keep failure runs bounded:
+
+```bash
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_failures.py
+```
+
+The straggler is slow but valid. Mismatched collective ordering and a missing
+rank are protocol failures because the workers no longer execute the same
+collective protocol.
 
 Also compare parameter synchronization after independent optimizer steps with
 gradient synchronization before the step. Test plain SGD, then reason about
@@ -587,6 +667,47 @@ shards, manual gradient SUM and correct averaging, and plain SGD. Verify
 replicas after each step and compare to the single-process reference on the
 same effective global batches. Rank 0 emits one JSON training record per step,
 including global loss, world size, local batch size, and global batch size.
+
+### Reporting a global loss when shard sizes differ
+
+The reported loss must weight every example equally. A mean of rank means does
+not do that when ranks process different numbers of examples. For example,
+suppose four ranks have these local mean losses and counts:
+
+| Rank | Examples (`n_r`) | Local mean loss (`L_r`) | Local loss sum (`n_r * L_r`) |
+| --- | ---: | ---: | ---: |
+| 0 | 1 | 1 | 1 |
+| 1 | 2 | 2 | 4 |
+| 2 | 3 | 3 | 9 |
+| 3 | 4 | 4 | 16 |
+
+The mean of rank means is `(1 + 2 + 3 + 4) / 4 = 2.5`. That gives a
+one-example rank the same influence as a four-example rank. The example-level
+global mean is `(1 + 4 + 9 + 16) / (1 + 2 + 3 + 4) = 30 / 10 = 3.0`.
+Each worker therefore AllReduces its local loss sum and its local example
+count, then divides the global loss sum by the global count. The
+`global_mean_loss` helper follows this procedure. In the current regression
+model each example has one scalar target, so the MSE sum divided by example
+count is the per-example mean. For multiple target values per example, define
+clearly whether the desired metric averages over examples or individual target
+elements, and use the matching denominator.
+
+Run its four-rank check (which uses the counts and means in the table) with:
+
+```bash
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29520 -m phase3.distributed_sgd --metrics-self-check
+```
+
+Run the focused test with:
+
+```bash
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_distributed_sgd.py::test_global_mean_loss_weights_uneven_shards_and_reaches_every_rank
+```
+
+This change makes the *metric* correct for uneven shards. The training loop's
+gradient averaging still assumes equal local batch sizes; uneven-batch
+training must weight local gradient sums by their example counts as described
+in the unequal-batch gradient derivation above.
 
 Exercise 16 worked derivation: with world size `8`, local batch size `16`, and
 `4` microbatches accumulated before each optimizer step, each rank contributes

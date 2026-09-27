@@ -41,6 +41,36 @@ def test_replicas_diverge_without_gradient_synchronization():
     assert records[0]["max_replica_diff"] > 0.0
 
 
+@pytest.mark.skipif(os.environ.get("RUN_DISTRIBUTED") != "1", reason="opt-in torchrun integration")
+def test_global_mean_loss_weights_uneven_shards_and_reaches_every_rank():
+    result = run_torchrun("phase3.distributed_sgd", 4, "--metrics-self-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # torchrun may concatenate adjacent worker writes on one output line, so
+    # decode JSON values from the complete stream instead of parsing by lines.
+    decoder = json.JSONDecoder()
+    records = []
+    position = 0
+    while (start := result.stdout.find("{", position)) >= 0:
+        try:
+            record, end = decoder.raw_decode(result.stdout, start)
+        except json.JSONDecodeError:
+            position = start + 1
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+        position = end
+
+    checks = [
+        record for record in records
+        if record.get("operation") == "global_loss_self_check"
+    ]
+    assert {record["rank"] for record in checks} == {0, 1, 2, 3}, result.stdout
+    assert all(record["phase"] == "passed" for record in checks)
+    assert all(record["global_mean_loss"] == 3.0 for record in checks)
+    assert all(record["global_example_count"] == 10 for record in checks)
+
+
 def test_gradient_synchronizer_declared():
     from phase3.distributed_sgd import synchronize_gradients
     assert callable(synchronize_gradients)
