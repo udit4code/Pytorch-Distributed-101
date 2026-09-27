@@ -160,10 +160,85 @@ zero examples and what to do if the global sample count is zero.
 
 ## 7. Manual AllReduce
 
-First assemble Reduce + Broadcast. Then use only send/recv to gather values at
-a root and distribute the sum. The simple algorithms are intentionally
-inefficient: they show that AllReduce is a communication algorithm, not magic.
-Do not use Reduce/Broadcast/AllReduce in the point-to-point version.
+The module implements two ways to assemble AllReduce. Both use four processes
+and the same rank-local input tensors:
+
+```text
+rank 0: [1, 10]
+rank 1: [2, 20]
+rank 2: [3, 30]
+rank 3: [4, 40]
+```
+
+The elementwise SUM is `[10, 100]`. After either function returns, every rank's
+input tensor should contain `[10, 100]`.
+
+### Method A: Reduce, then Broadcast
+
+`naive_all_reduce_sum` asks the distributed backend to do two collectives. All
+ranks call the same operations in the same order:
+
+1. `dist.reduce(..., dst=0, op=SUM)` combines all four tensors at rank 0. Rank
+   0's tensor becomes `[10, 100]`; only rank 0 is guaranteed to have the sum.
+2. `dist.broadcast(..., src=0)` copies rank 0's tensor to every other rank.
+   Now ranks 0, 1, 2, and 3 all hold `[10, 100]`.
+
+The backend performs the reduction and broadcast communication. This version
+is short and directly demonstrates that AllReduce can be composed from the
+Phase 2 Reduce and Broadcast operations.
+
+### Method B: point-to-point send and recv
+
+`point_to_point_all_reduce_sum` builds both phases explicitly using only
+blocking `send` and `recv`. Rank 0 is the root in this example:
+
+1. Rank 0 copies its `[1, 10]` into an accumulator.
+2. Ranks 1, 2, and 3 each send their original tensor to rank 0. Rank 0 receives
+   one sender at a time and adds it to its accumulator:
+
+   ```text
+   start:          [1, 10]  (rank 0's contribution)
+   after rank 1:   [3, 30]
+   after rank 2:   [6, 60]
+   after rank 3:   [10, 100]
+   ```
+
+3. Rank 0 copies `[10, 100]` into its input tensor and sends that result to
+   ranks 1, 2, and 3. Each peer receives the result into its own tensor.
+4. The function returns on each rank with `[10, 100]`.
+
+The non-root ranks block in their send until rank 0 receives their contribution,
+then block in their receive until rank 0 sends the sum. Rank 0 receives every
+contribution before sending results. These matched operations provide the
+ordering, so this protocol does not need a barrier.
+
+### How the implementations differ
+
+| Reduce + Broadcast | Point-to-point |
+| --- | --- |
+| Calls `dist.reduce` and `dist.broadcast`. | Calls only `dist.send` and `dist.recv`. |
+| The backend performs the reduction and distributes the result. | Rank 0 explicitly receives, adds, and sends tensors. |
+| Shorter and closer to the collective API. | More code; exposes the message flow and ordering directly. |
+| Demonstrates composition of collectives. | Demonstrates that AllReduce can be built as a communication algorithm. |
+
+Run both methods on four real processes and compare each result against native
+AllReduce:
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  -m phase3.manual_all_reduce --self-check
+```
+
+Each rank prints a JSON record with `"phase": "passed"` if both manual
+results equal `[10, 100]`. The focused pytest integration test is:
+
+```bash
+RUN_DISTRIBUTED=1 python -m pytest -q \
+  tests/test_manual_all_reduce.py::test_manual_reduce_broadcast_and_point_to_point_match_native
+```
+
+Do not call Reduce, Broadcast, or AllReduce inside the point-to-point function;
+the native AllReduce is used only by the self-check as the expected reference.
 
 ## 8. Data partitioning
 
