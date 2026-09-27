@@ -1,6 +1,5 @@
-"""Opt-in real torchrun subprocess tests; enable with PHASE1_RUN_DISTRIBUTED=1."""
+"""Opt-in real torchrun subprocess tests; enable with RUN_DISTRIBUTED=1."""
 
-import json
 import json
 import os
 import platform
@@ -36,7 +35,10 @@ def run_torchrun(module: str, nproc: int, *args: str, timeout: int = 30):
     )
 
 
-pytestmark = pytest.mark.skipif(os.environ.get("PHASE1_RUN_DISTRIBUTED") != "1", reason="opt in to real torchrun tests")
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_DISTRIBUTED") != "1",
+    reason="set RUN_DISTRIBUTED=1 to run real torchrun tests",
+)
 
 
 def test_basic_send_recv():
@@ -195,7 +197,7 @@ def test_invalid_protocol_terminates_with_finite_timeout():
     assert result.returncode != 0
     assert "Timeout" in result.stdout + result.stderr or "timeout" in result.stdout + result.stderr
 
-@pytest.mark.skipif(os.environ.get("PHASE2_RUN_DISTRIBUTED") != "1", reason="opt in to Phase 2 capstone subprocess test")
+
 def test_phase2_capstone_global_metric():
     result = run_torchrun("phase2.algorithms", 4, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr

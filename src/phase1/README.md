@@ -454,16 +454,16 @@ The unit tests run without launching a distributed job:
 uv run --group dev pytest
 ```
 
-The real multi-process integration tests use `torchrun` subprocesses. They are opt-in so a normal `pytest` run does not launch many workers:
+The real multi-process integration tests use `torchrun` subprocesses. They are opt-in so a normal `pytest` run does not launch many workers. `RUN_DISTRIBUTED` is the repository-wide switch for every phase, so the command stays the same as more phases are added:
 
 ```bash
-PHASE1_RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
+RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
 ```
 
 On macOS, include the loopback interface setting:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 PHASE1_RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
+GLOO_SOCKET_IFNAME=lo0 RUN_DISTRIBUTED=1 uv run --group dev pytest tests/test_integration.py
 ```
 
 The integration helper selects a free port, uses `127.0.0.1`, and sets Gloo's interface based on the OS. Tests check basic/scalar/many-to-one messages, the ordered exchange, receive ordering and tagged matching, async ring exchange and timing-event order, blocking ring behavior, circulation, ring gather, distinct worker PIDs, and one bounded invalid protocol. The invalid-protocol test expects a nonzero worker exit. Each subprocess has an outer timeout.

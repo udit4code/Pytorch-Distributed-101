@@ -25,11 +25,12 @@ The commands below use the macOS loopback interface, `lo0`. On Linux, replace
 `GLOO_SOCKET_IFNAME=lo0` with `GLOO_SOCKET_IFNAME=lo`.
 
 Run examples with bounded process-group timeouts. Real distributed tests launch
-subprocesses and are opt-in. For example, the
+subprocesses and are opt-in through the repository-wide `RUN_DISTRIBUTED`
+switch. The same variable applies to every phase. For example, the
 [native broadcast tests](../../tests/test_broadcast.py) run with:
 
 ```bash
-PHASE2_RUN_DISTRIBUTED=1 uv run pytest tests/test_broadcast.py
+RUN_DISTRIBUTED=1 uv run pytest tests/test_broadcast.py
 ```
 
 Each distributed test also places an outer timeout around `torchrun`, because

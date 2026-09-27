@@ -1,8 +1,11 @@
-"""Native collective subprocess coverage (requires implementing the demo TODO)."""
+"""Opt-in torchrun integration coverage for native broadcast."""
 import json, os, platform, shutil, socket, subprocess
 import pytest
 
-@pytest.mark.skipif(os.environ.get("PHASE2_RUN_DISTRIBUTED") != "1", reason="opt in to torchrun subprocess tests")
+@pytest.mark.skipif(
+    os.environ.get("RUN_DISTRIBUTED") != "1",
+    reason="set RUN_DISTRIBUTED=1 to run real torchrun tests",
+)
 @pytest.mark.parametrize("src,value", [(0,100),(2,999)])
 def test_broadcast_all_ranks_receive_root_value(src, value):
     torchrun = shutil.which("torchrun")

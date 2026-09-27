@@ -166,10 +166,12 @@ The `mismatched_collective_demo()` function deliberately demonstrates an incompa
 6. Use bounded timeouts in small experiments. A timeout is a diagnostic; it does not repair an inconsistent collective sequence.
 7. Ensure cleanup runs when worker code raises, and terminate/restart the full job after a broken collective.
 
-For test runs, the integration test selects a free loopback port and sets the correct loopback interface for macOS or Linux. Run it with:
+For test runs, the integration test selects a free loopback port and sets the
+correct loopback interface for macOS or Linux. `RUN_DISTRIBUTED` is the shared
+opt-in switch for integration tests in every phase. Run it with:
 
 ```bash
-PHASE0_RUN_DISTRIBUTED=1 uv run pytest tests/test_integration.py -vv -s
+RUN_DISTRIBUTED=1 uv run pytest tests/test_integration.py -vv -s
 ```
 
 The test captures worker output and compares rank/PID/counter sets, not print order.

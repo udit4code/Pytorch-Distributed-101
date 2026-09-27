@@ -12,8 +12,8 @@ import pytest
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("PHASE2_RUN_DISTRIBUTED") != "1",
-    reason="opt in to real Phase 2 torchrun tests",
+    os.environ.get("RUN_DISTRIBUTED") != "1",
+    reason="set RUN_DISTRIBUTED=1 to run real torchrun tests",
 )
 
 
