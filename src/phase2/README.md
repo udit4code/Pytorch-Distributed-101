@@ -708,7 +708,54 @@ it does not make an invalid protocol correct or guarantee a clear diagnosis.
 
 ## 14. Capstone: mini coordinator
 
-Complete `algorithms.run_capstone()` using only broadcast, barrier, and reduce. Rank zero starts with seed 123 and 5 steps; every rank performs deterministic, rank-varying toy work; all synchronize before metric aggregation; rank zero prints JSON with world size, total examples, and global mean loss. The scaffold uses counts 1,2,3,4 and per-rank loss sums `(rank+1)*5`, so expected totals are 10 examples and mean loss 5.0. Explain the flow as one-to-many, everyone waits, many-to-one.
+`algorithms.run_capstone()` uses broadcast, barrier, and reduce to coordinate a
+small four-rank job. Rank zero starts with seed 123 and 5 steps. Every rank
+performs deterministic, rank-varying toy work, all ranks synchronize before
+metric aggregation, and rank zero prints the global result.
+
+Run it from the repository root:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29710 \
+  -m phase2.algorithms
+```
+
+On Linux, use `GLOO_SOCKET_IFNAME=lo`.
+
+### Capstone dry run
+
+1. **One-to-many:** R0 starts with configuration `[123, 5]`; R1, R2, and R3
+   start with `[0, 0]`. All four ranks call broadcast with `src=0`, after which
+   every rank has seed 123 and 5 steps.
+2. **Local work:** rank `r` processes `r + 1` examples and produces loss sum
+   `(r + 1) * 5`.
+3. **Everyone waits:** all ranks enter the barrier. A rank can leave only after
+   R0, R1, R2, and R3 have all arrived.
+4. **Many-to-one:** every rank packs `[local_loss_sum, local_examples]` into a
+   `float64` tensor and calls SUM reduce with `dst=0`.
+
+| Rank | Configuration after broadcast | Local loss sum | Local examples | Reduction contribution |
+|---:|---|---:|---:|---|
+| 0 | `[123, 5]` | 5 | 1 | `[5, 1]` |
+| 1 | `[123, 5]` | 10 | 2 | `[10, 2]` |
+| 2 | `[123, 5]` | 15 | 3 | `[15, 3]` |
+| 3 | `[123, 5]` | 20 | 4 | `[20, 4]` |
+
+R0 receives the elementwise sum `[50, 10]` and computes `50 / 10 = 5.0`.
+Reducing the loss sum and example count is correct even when ranks process
+different numbers of examples. Averaging four local means would generally be
+wrong because it would give a rank with one example the same weight as a rank
+with four examples.
+
+The expected output is:
+
+```json
+{"global_mean_loss": 5.0, "total_examples": 10, "world_size": 4}
+```
 
 ## 15. Paper-and-pencil exercises
 
@@ -722,8 +769,26 @@ Fill in before looking up the semantics:
 
 | Operation | Input location | Result location |
 |---|---|---|
-| Broadcast | ? | ? |
-| Reduce | ? | ? |
+| Broadcast | Source rank | Every rank in the process group |
+| Reduce | Every rank in the process group | Destination rank only |
+
+### Answers
+
+1. Broadcast uses R2 as the source, so R0, R1, R2, and R3 all finish with
+   `[2]`. Every group member participates, including the source.
+2. SUM is `5 + 9 + 2 + 7 = 23`, so R3 holds `[23]`. Only the destination R3 is
+   guaranteed to hold the reduced result; the other output buffers must not be
+   used as though they contain the global sum.
+3. Broadcast moves one source rank's value outward to every group member.
+   Reduce moves every member's contribution inward, combines the values with
+   an operator, and guarantees the result only at the destination.
+4. R0 can leave at approximately `t=8s`, after the final participant reaches
+   the barrier. It waits about seven seconds. The example shows that a single
+   straggler determines when synchronous workers can continue.
+5. Direct fan-out makes the root send 1 GB to each of 1,023 peers: 1,023 GB of
+   root-originated traffic and 1,023 sequential root sends in the simple
+   blocking implementation. A tree broadcast lets informed ranks forward the
+   tensor, reducing ideal communication depth from `O(P)` to `O(log P)` rounds.
 
 ## 16. Questions and interview checkpoint
 
