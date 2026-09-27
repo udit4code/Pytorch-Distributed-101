@@ -592,7 +592,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pytorch-distributed-phase2"
+name = "pytorch-distributed-phase3"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

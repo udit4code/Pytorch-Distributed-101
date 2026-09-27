@@ -15,28 +15,72 @@ This phase intentionally leaves the learning-critical operations unfinished.
 Each exercise function has a detailed `TODO: IMPLEMENT` comment; its tests
 specify behavior and should fail until the corresponding exercise is done.
 
-## Setup and launch
+## Start here: a live four-process AllReduce
 
-From the repository root, install the editable package and development tools:
+Run every command from the repository root. This exercise uses four independent
+Python processes on the same machine. `torchrun` starts them and assigns each a
+rank: `0`, `1`, `2`, or `3`. The ranks join one Gloo process group before they
+communicate. Each process runs the same Python module, but `dist.get_rank()`
+returns a different rank in each process.
 
-```bash
-python -m pip install -e '.[dev]'
+### First principles: what should the result be?
+
+The code creates one local tensor per process. Rank `r` contributes
+`[r + 1, 10 * (r + 1)]`, so the four independent inputs are:
+
+```text
+rank 0: [1, 10]
+rank 1: [2, 20]
+rank 2: [3, 30]
+rank 3: [4, 40]
 ```
 
-The basic demonstration uses CPU tensors and Gloo:
+An AllReduce with SUM adds values at matching tensor positions across all
+processes and makes the completed sum available to every process:
+
+```text
+first position: 1 + 2 + 3 + 4       = 10
+second position: 10 + 20 + 30 + 40 = 100
+```
+
+Thus, after the collective, **each rank** should hold `[10, 100]`. It is not
+just rank 0 receiving the answer. Each process has a local tensor; the
+collective overwrites that tensor with the global sum. For synchronous data
+parallel training, this is useful because each process needs the same combined
+gradient before it updates its own model replica.
+
+### Run the demonstration
+
+Make sure PyTorch is installed in the active Python environment, then run:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 -m phase3.all_reduce_demo
 ```
 
-Unit tests run with `pytest`. Real multiprocess tests use `torchrun` subprocesses
-and are opt-in so a normal test run does not spawn workers:
+Each process prints a JSON record before and after AllReduce. In the records
+whose `"phase"` is `"after"`, check that ranks 0 through 3 all report
+`"values": [10, 100]`. The records may appear in a different order because the
+processes print independently.
+
+### Test the live four-process behavior
+
+The integration test launches a real `torchrun` subprocess; it does not mock
+`torch.distributed`. From the repository root, run:
 
 ```bash
-RUN_DISTRIBUTED=1 pytest tests/test_all_reduce.py tests/test_manual_all_reduce.py \
-  tests/test_gradient_sync.py tests/test_distributed_sgd.py tests/test_sampler.py \
-  tests/test_parameter_consistency.py tests/test_integration.py
+RUN_DISTRIBUTED=1 python -m pytest -q \
+  tests/test_all_reduce.py::test_all_reduce_demo_returns_expected_sum_on_every_rank
 ```
+
+This test checks that the command exits successfully, observes output from all
+four ranks, and verifies every rank's result is `[10, 100]`. If pytest is not
+installed in the active environment, install it with `python -m pip install
+pytest` and retry. A normal `python -m pytest` run skips tests marked as real
+distributed integration tests unless `RUN_DISTRIBUTED=1` is set.
+
+The remaining Phase 3 exercises are intentionally unfinished. Their tests
+describe expected behavior, but those tests are expected to fail until you
+implement the corresponding TODOs.
 
 ## 1. Goal
 

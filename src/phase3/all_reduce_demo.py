@@ -8,12 +8,11 @@ from .distributed import cleanup_process_group, rank_record, setup_process_group
 def all_reduce_sum_(tensor: torch.Tensor) -> torch.Tensor:
     """Sum ``tensor`` across the default group; each rank must receive the sum.
 
-    TODO: IMPLEMENT: invoke the SUM AllReduce in place, preserving dtype and
-    shape. All ranks must call this in the same collective order.
+    The operation is in place: ``tensor`` is overwritten with the global sum.
+    All ranks must call this collective in the same order.
     """
-    # TODO: IMPLEMENT
-    raise NotImplementedError
-
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor 
 
 def run() -> None:
     """Run the four-rank [rank+1, 10*(rank+1)] demonstration."""
