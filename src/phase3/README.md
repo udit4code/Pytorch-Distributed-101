@@ -193,6 +193,25 @@ An empty rank contributes a zero gradient sum and count zero. Its local mean
 gradient is undefined, so use a zero tensor for its contribution. The total
 sample count across the process group must still be positive.
 
+### Run the gradient averaging check
+
+This launches four Gloo processes. The equal-batch check uses local gradients
+`1, 2, 3, 4`, so each rank should report `2.5`. The weighted check uses counts
+`0, 1, 2, 3` and local means `0, 2, 4, 6`; its global result is `14/3` on every
+rank. Rank 0 has no examples, so the check also verifies that its placeholder
+gradient is zeroed before aggregation.
+
+```bash
+RUN_DISTRIBUTED=1 python -m pytest -q tests/test_gradient_sync.py::test_equal_and_unequal_gradient_aggregation
+```
+
+The test parses each rank's JSON record and checks both results. To run the
+same worker check directly, use:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.gradient_sync --self-check
+```
+
 ### Paper-and-pencil derivation 2
 
 Without looking above, derive the weighted formula from the definition of each
