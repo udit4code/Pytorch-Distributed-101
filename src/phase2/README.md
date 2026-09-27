@@ -462,11 +462,240 @@ tensor, pipeline, or expert-parallel communication scopes.
 
 ## 11. Collective ordering
 
-Within a group, ranks must execute compatible collectives in compatible order. If some ranks do Broadcast then Reduce while another does Reduce then Broadcast, operations can mismatch, error, or time out. A rank skipping a collective has similar consequences. `failures.py` provides bounded ordering, missing participant, shape, and dtype experiments; backend behavior varies, so protocol violations can produce errors, timeouts, or hang-like behavior.
+Within one process group, every rank must execute compatible collectives in the
+same order. Think of the group as one distributed program whose instruction
+pointer is copied across processes. The first collective called by every rank
+must describe one compatible operation, then the second collective must do the
+same, and so on.
+
+For example, this sequence is valid:
+
+| Collective slot | R0 | R1 | R2 | R3 |
+|---:|---|---|---|---|
+| 0 | Broadcast | Broadcast | Broadcast | Broadcast |
+| 1 | Barrier | Barrier | Barrier | Barrier |
+
+The processes need not enter a slot at exactly the same instant. A fast rank
+may wait for a slow rank. They must eventually enter the same protocol with
+compatible arguments.
 
 ## 12. Failure modes
 
-Treat every collective as a distributed protocol with shared assumptions: group membership, call order, root, tensor shape, and dtype. Do not assume mismatches always produce a clean Python exception. Use finite process-group and test timeouts. The negative examples are experiments, not production patterns.
+`failures.py` deliberately breaks four parts of that protocol. These are
+negative experiments, so a nonzero exit, timeout, or apparent hang is the
+expected result. Run them one at a time from the repository root. Each command
+uses a different rendezvous port so a previous failed launch cannot collide
+with the next one.
+
+```bash
+# macOS; use GLOO_SOCKET_IFNAME=lo on Linux.
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 --nproc-per-node=4 \
+  --master-addr=127.0.0.1 --master-port=29690 \
+  -m phase2.failures ordering
+
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 --nproc-per-node=4 \
+  --master-addr=127.0.0.1 --master-port=29691 \
+  -m phase2.failures missing
+
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 --nproc-per-node=4 \
+  --master-addr=127.0.0.1 --master-port=29692 \
+  -m phase2.failures shape
+
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 --nproc-per-node=4 \
+  --master-addr=127.0.0.1 --master-port=29693 \
+  -m phase2.failures dtype
+```
+
+The process group is configured with an eight-second timeout. That bounded the
+ordering and missing-participant runs on the tested macOS/Gloo environment,
+but it did not stop either metadata-mismatch run. Use an outer subprocess
+timeout in automation. When running manually, press `Ctrl-C` if a negative
+experiment remains stuck.
+
+### How to read the failure output
+
+Four workers write to the same terminal, so tracebacks can be interleaved and
+their order can change between runs. Read the output in this order:
+
+1. Find the first rank-level exception. It is usually closest to the actual
+   failed collective.
+2. Identify the collective named by its Python stack frame, such as
+   `dist.broadcast` or `dist.barrier`.
+3. Read the Gloo message. `Timed out waiting ... for send/recv` describes what
+   the transport was waiting for; it does not mean the Python code explicitly
+   called `dist.send` or `dist.recv`.
+4. Treat the final `ChildFailedError` as `torchrun` reporting that at least one
+   child process failed. It is a launcher summary, not the root cause.
+5. If the run was manually interrupted, the final `SignalException` with
+   signal 2 means `torchrun` received `SIGINT` from `Ctrl-C`. It says how the
+   experiment was stopped, not why the collective became stuck.
+
+### Case 1: incompatible collective order (`ordering`)
+
+The code creates this protocol:
+
+| Collective slot | R0 | R1 | R2 | R3 |
+|---:|---|---|---|---|
+| 0 | Broadcast | Broadcast | Barrier | Broadcast |
+| 1 | Barrier | Barrier | Broadcast | Barrier |
+
+At slot zero, R0, R1, and R3 wait for a broadcast involving the whole WORLD
+group. R2 waits for a WORLD barrier. Neither operation can collect all four
+participants, and no rank can advance to repair the mismatch because each is
+blocked in its current operation.
+
+The observed rank-level errors after about eight seconds included:
+
+```text
+rank 0: dist.broadcast(...) -> Timed out waiting 8000ms for send operation
+rank 2: dist.barrier(...)   -> Timed out waiting 8000ms for recv operation
+ranks 1 and 3: dist.barrier(...) -> Timed out waiting 8000ms for recv operation
+```
+
+R1 and R3 entered `broadcast` first, but their traceback points at the later
+`barrier`. A collective may return at different moments on different ranks;
+the eventual traceback is where that rank noticed the broken protocol, not
+necessarily where the bug began. The full sequence across all ranks is the
+unit that must be inspected.
+
+**Failure mode:** distributed deadlock until the backend timeout converts it
+to exceptions and `torchrun` terminates the job.
+
+**Why it matters:** real training loops often contain rank-dependent branches.
+If one branch changes collective order, the whole job can stop even though
+every individual process is still alive.
+
+**Key lesson:** all members of a process group must follow one globally
+consistent collective sequence. Log the rank, group, operation, and sequence
+number around collectives when diagnosing an ordering bug.
+
+### Case 2: missing participant (`missing`)
+
+R0, R1, and R2 call a barrier on WORLD. R3 skips it:
+
+| Rank | Action |
+|---:|---|
+| 0 | Enter WORLD barrier |
+| 1 | Enter WORLD barrier |
+| 2 | Enter WORLD barrier |
+| 3 | Skip barrier and continue to cleanup |
+
+A four-rank barrier records arrivals until its group membership condition is
+satisfied: four arrivals are required. Three arrivals can never complete it.
+R3 calling `destroy_process_group()` does not count as arriving at the barrier.
+
+The observed errors after about eight seconds were:
+
+```text
+ranks 0 and 1: dist.barrier() -> Timed out waiting 8000ms for recv operation
+rank 2:        dist.barrier() -> Timed out waiting 8000ms for send operation
+torchrun: ChildFailedError
+```
+
+Which rank reports a send or receive timeout is an implementation detail of
+the barrier algorithm. The useful fact is that every traceback points to the
+same incomplete WORLD barrier.
+
+**Failure mode:** the participating ranks wait forever in the abstract
+protocol; the configured backend timeout eventually aborts this run.
+
+**Why it matters:** an early return, exception, exhausted data loader, or
+rank-only code path can silently remove one worker from a later collective and
+strand every remaining worker.
+
+**Key lesson:** group membership defines an obligation to participate. If only
+a subset should communicate, create and use a subgroup instead of conditionally
+skipping a WORLD collective.
+
+### Case 3: incompatible tensor shape (`shape`)
+
+Broadcast is in-place. It does not first broadcast a Python tensor description
+and allocate a matching result. Every non-source rank supplies its own receive
+buffer before entering the collective. The ranks therefore need a shared
+contract for element count, shape, dtype, device, source rank, and group.
+
+This experiment violates the element-count part of the contract:
+
+| Rank | Buffer before broadcast from R0 |
+|---:|---|
+| 0, 1, 3 | four `float32` elements (16 bytes) |
+| 2 | eight `float32` elements (32 bytes) |
+
+Conceptually, R0 offers one 16-byte payload while R2 participates with a
+32-byte destination. The collective has no application-level rule saying
+whether R2 should receive four values, wait for eight values, resize itself,
+or preserve its remaining values.
+
+On the tested macOS/Gloo build, this run printed no rank-level exception and
+did not terminate after 15 seconds, even though the process-group timeout was
+eight seconds. It had to be interrupted. The final log was the launcher's
+`SignalException: ... signal: 2`, caused by that interrupt. Other PyTorch
+versions, backends, and devices may instead report an error or fail in another
+way.
+
+**Failure mode:** undefined collective protocol behavior, observed here as a
+hang-like stall that was not converted into a useful backend timeout.
+
+**Why it matters:** shapes can diverge through uneven batches, rank-dependent
+model paths, or incorrect padding. A metadata mistake can look like a network
+problem because the communication layer only sees incompatible buffers.
+
+**Key lesson:** validate or establish tensor metadata before the collective.
+For dynamic data, communicate the metadata first, allocate a compatible
+buffer, and then broadcast the payload.
+
+### Case 4: incompatible tensor dtype (`dtype`)
+
+This experiment gives R0, R1, and R3 one `float32` element but gives R2 one
+`int64` element:
+
+| Rank | Logical element count | Dtype | Buffer size |
+|---:|---:|---|---:|
+| 0, 1, 3 | 1 | `float32` | 4 bytes |
+| 2 | 1 | `int64` | 8 bytes |
+
+The matching shape does not make the buffers compatible. A collective
+transports tensor storage; it does not perform an implicit numeric cast from
+the source dtype to each receiver's dtype. R0 therefore supplies a four-byte
+value while R2 declares an eight-byte destination with a different
+interpretation.
+
+The observed behavior matched the shape case: no rank-level exception and no
+termination after 15 seconds. After `Ctrl-C`, the launcher reported SIGINT
+rather than a dtype diagnostic. Backend behavior can differ, so a clean error
+must not be relied upon.
+
+**Failure mode:** undefined collective protocol behavior, observed here as an
+unbounded stall until the outer launcher was interrupted.
+
+**Why it matters:** mixed precision, integer counters, and model state often
+put several dtypes in the same program. Accidentally choosing a different
+buffer on one rank can stop the complete job or produce an invalid result on a
+backend that does not reject the mismatch.
+
+**Key lesson:** dtype is part of the wire protocol. Convert tensors explicitly
+to one agreed dtype before entering the collective.
+
+### Combined observation
+
+| Scenario | Broken assumption | Observed result on this machine | Main prevention |
+|---|---|---|---|
+| `ordering` | Same operation at each collective slot | Gloo timeout, then `ChildFailedError` | Keep one group-wide operation order |
+| `missing` | Every group member participates | Gloo timeout, then `ChildFailedError` | Use the correct group and control flow |
+| `shape` | Compatible element count and shape | Stalled past the process-group timeout; manually interrupted | Agree on metadata before payload |
+| `dtype` | Compatible dtype and byte layout | Stalled past the process-group timeout; manually interrupted | Cast explicitly to one dtype |
+
+The general rule is to treat a collective as a distributed protocol call.
+Its contract includes the process group, position in the collective sequence,
+operation, source or destination rank, tensor metadata, and reduction operator
+where applicable. Validate those invariants at application boundaries, include
+rank and operation context in logs, configure a process-group timeout, and put
+an independent outer timeout around negative tests. A timeout limits damage;
+it does not make an invalid protocol correct or guarantee a clear diagnosis.
 
 ## 13. Training-related examples
 
