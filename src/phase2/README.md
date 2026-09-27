@@ -1,8 +1,15 @@
 # PyTorch Distributed Phase 2: Collectives
 
-This phase builds on Phase 0 (processes, ranks, groups, `torchrun`, Gloo) and Phase 1 (point-to-point messaging and ring-gather). Work through each exercise by drawing what every process does before running it. The communication logic is intentionally left as `# TODO: IMPLEMENT` in the code.
+This phase builds on [Phase 0](../phase0/README.md) (processes, ranks, groups,
+`torchrun`, and Gloo) and [Phase 1](../phase1/README.md) (point-to-point
+messaging and ring-gather). The implementations are complete, so the notes can
+be read alongside runnable examples. Draw what every process does before
+running an example, then compare that prediction with its logs.
 
 ## 1. Goal
+
+**Code:** [process-group lifecycle and structured logging](./distributed.py),
+[all Phase 2 modules](./), and [the capstone](./algorithms.py).
 
 Understand the global problem each collective solves, who participates, where the result appears, what synchronization is involved, and how point-to-point messages could realize the same semantics. This is not an API memorization exercise.
 
@@ -17,9 +24,22 @@ uv sync --group dev
 The commands below use the macOS loopback interface, `lo0`. On Linux, replace
 `GLOO_SOCKET_IFNAME=lo0` with `GLOO_SOCKET_IFNAME=lo`.
 
-Run examples with bounded process-group timeouts. The real subprocess tests are opt-in with `PHASE2_RUN_DISTRIBUTED=1 pytest tests/test_broadcast.py`; each subprocess also has an outer timeout. Fill in each TODO, then replace/enable the corresponding scaffold assertions.
+Run examples with bounded process-group timeouts. Real distributed tests launch
+subprocesses and are opt-in. For example, the
+[native broadcast tests](../../tests/test_broadcast.py) run with:
+
+```bash
+PHASE2_RUN_DISTRIBUTED=1 uv run pytest tests/test_broadcast.py
+```
+
+Each distributed test also places an outer timeout around `torchrun`, because
+a process-group timeout does not catch every invalid collective protocol.
 
 ## 2. From point-to-point to collectives
+
+**Code:** [manual broadcast](./manual_broadcast.py),
+[manual reduction](./manual_reduce.py), and
+[shared distributed helpers](./distributed.py).
 
 Phase 1 transferred between named peers:
 
@@ -41,9 +61,13 @@ A collective is not “rank 0 calls a function that modifies other ranks.” Eve
 
 ## 3. Broadcast semantics
 
+**Code:** [native broadcast demonstration](./broadcast_demo.py) and
+[broadcast integration tests](../../tests/test_broadcast.py).
+
 Broadcast distributes one rank's tensor to all members of the group. The `src` rank supplies the input; all ranks, including source, call the collective. Source's tensor remains available and each non-source tensor buffer receives its contents. `src=0` is a convention in examples, not a special capability of rank zero.
 
-`broadcast_demo.py` begins with source value 100 and placeholders elsewhere.
+The [broadcast demonstration](./broadcast_demo.py) begins with source value
+100 and placeholders elsewhere.
 
 Run a four-rank broadcast from rank zero:
 
@@ -96,13 +120,42 @@ with a barrier.
 
 ## 4. Manual broadcast
 
-Complete `manual_broadcast(tensor, src)` using only blocking `dist.send` and `dist.recv`. All world ranks call the function. Non-root processes allocate compatible buffers before calling. For P ranks and N bytes, reason about the direct source's send volume: how many copies must it send? What if rank zero must transmit a 10 GB tensor directly to 1,023 peers?
+**Code:** [`manual_broadcast`](./manual_broadcast.py) and its command-line
+driver in the same module.
+
+`manual_broadcast(tensor, src)` uses only blocking `dist.send` and `dist.recv`.
+All world ranks call the function. Non-root processes allocate compatible
+buffers before calling. For P ranks and N bytes, the source sends `P - 1`
+copies and originates `(P - 1) * N` bytes. If rank zero transmits a 10 GB
+tensor directly to 1,023 peers, it must originate 10,230 GB of data and perform
+1,023 blocking sends.
 
 Use a fixed, agreed tensor shape and dtype. Since this function receives a tensor buffer rather than a shape descriptor, non-root buffers must already have the correct layout.
 
+Run the direct point-to-point implementation with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29624 \
+  -m phase2.manual_broadcast \
+  --algorithm manual \
+  --src 0 \
+  --value 100
+```
+
+The before records contain `[100]` on R0 and `[-1]` elsewhere. Every after
+record contains `[100]`.
+
 ## 5. Tree broadcast
 
-Complete `tree_broadcast` for source zero and power-of-two world size. For four ranks, double the set of informed ranks each round:
+**Code:** [`tree_broadcast`](./manual_broadcast.py) and the
+[broadcast benchmark](./broadcast_benchmark.py).
+
+`tree_broadcast` handles source zero and a power-of-two world size. It doubles
+the set of informed ranks in each round. For four ranks:
 
 ```text
 step 0: R0 has X
@@ -111,14 +164,33 @@ step 2: R0 ──> R2; R1 ──> R3
 final:  R0 R1 R2 R3 have X
 ```
 
-Draw eight ranks and compare the number of communication rounds with naive fan-out. Do not over-optimize or benchmark localhost performance.
+Extending the drawing to eight ranks gives three tree rounds, compared with
+seven sequential sends from the source in naive blocking fan-out. This is the
+communication-depth argument; the measured localhost result is discussed
+below.
 
-### Broadcast benchmark scaffold
+Run the four-rank tree implementation with:
 
-`broadcast_benchmark.py` compares the direct fan-out and binary-tree
-implementations after process-group initialization. It performs warmups,
-checks the received tensor, and reports the slowest rank's elapsed time for
-each trial.
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29625 \
+  -m phase2.manual_broadcast \
+  --algorithm tree \
+  --src 0 \
+  --value 100
+```
+
+### Broadcast benchmark
+
+**Code:** [benchmark runner and measurement logic](./broadcast_benchmark.py).
+
+The [benchmark runner](./broadcast_benchmark.py) compares direct fan-out and
+binary-tree implementations after process-group initialization. It performs
+warmups, checks the received tensor, and reports the slowest rank's elapsed
+time for each trial.
 
 Run four ranks with a one-million-element `float32` tensor (about 4 MB):
 
@@ -148,6 +220,8 @@ GPU performance. Native `dist.broadcast` uses backend-specific optimized
 algorithms and should be the production comparison.
 
 #### Detailed local experiment
+
+**Code:** [trial synchronization, timing, validation, and reporting](./broadcast_benchmark.py).
 
 The experiment varied both dimensions that affect the algorithms:
 
@@ -183,6 +257,9 @@ fan-out was faster.
 
 #### Does this support the hypothesis?
 
+**Code:** [the two algorithms being compared](./manual_broadcast.py) and
+[the benchmark harness](./broadcast_benchmark.py).
+
 Only partially. The two-rank case is a sanity check: both implementations
 perform the same single `R0 -> R1` transfer, and their medians differ by at
 most 1.8%. At eight ranks, the tree improved median latency for the 1 and 4
@@ -206,11 +283,33 @@ backend's optimized `dist.broadcast` implementation.
 
 ## 6. Reduce semantics
 
+**Code:** [native reduce demonstration](./reduce_demo.py) and
+[native reduce integration tests](../../tests/test_reduce.py).
+
 Reduce combines each member's corresponding tensor elements using an operator and leaves the result at the designated destination. Everyone participates. For inputs `[1,10]`, `[2,20]`, `[3,30]`, `[4,40]`, SUM to rank zero gives `[10,100]`. Do not depend on non-destination buffers after reduce.
 
 Try `SUM`, `MAX`, `MIN`, and `PRODUCT` where backend/dtype supports them. For `1,5,3,2`, predict each result first. Reduction operators are generally expected to be associative for regrouping into efficient trees. SUM is central to aggregating gradients and metrics (we study only the semantics needed here).
 
+Run the native SUM reduction with:
+
+```bash
+GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
+  --nnodes=1 \
+  --nproc-per-node=4 \
+  --master-addr=127.0.0.1 \
+  --master-port=29640 \
+  -m phase2.reduce_demo \
+  --operator SUM \
+  --dst 0
+```
+
+R0 begins with `[1, 10]` and finishes with `[10, 100]`. Only R0's final
+buffer is part of the reduction result.
+
 ## 7. Manual reduction
+
+**Code:** [direct and tree reduction implementations](./manual_reduce.py) and
+[manual reduction integration tests](../../tests/test_manual_reduce.py).
 
 `manual_reduce` and `tree_reduce` implement reduction using point-to-point
 messages. Both default to `SUM` and also accept `MAX`, `MIN`, and `PRODUCT`.
@@ -231,6 +330,8 @@ Integer PRODUCT can overflow for large values, and backend/dtype support should
 always be checked when using native collectives.
 
 ### Direct SUM dry run: four-rank execution
+
+**Code:** [`manual_reduce`](./manual_reduce.py).
 
 Suppose each rank starts with `rank + 1` and the destination is rank zero:
 
@@ -275,6 +376,8 @@ different order between runs. Add `--quiet` when only the structured
 before/after records are needed.
 
 ### Tree SUM dry run: eight-rank execution
+
+**Code:** [`tree_reduce`](./manual_reduce.py).
 
 The tree version currently requires destination zero and a power-of-two world
 size. With rank-local values `[1]` through `[8]`, every active receiver holds a
@@ -344,6 +447,8 @@ Omitting `--operator` selects `SUM`.
 
 ### What complexity improves?
 
+**Code:** [direct and tree implementations used in the comparison](./manual_reduce.py).
+
 Let `P` be the number of ranks and `N` the tensor size.
 
 | Property | Direct reduction | Tree reduction |
@@ -369,7 +474,16 @@ bandwidth.
 
 ## 8. Barrier
 
-`dist.barrier()` makes each member wait until all members of its group reach that point. It does not copy tensors or make Python objects identical. `barrier_demo.py` delays ranks by 0, 1, 2, and 4 seconds and records before/after timestamps and wait duration. Predict when the fastest rank proceeds. A slow worker can make every faster worker idle at a synchronization point: the straggler problem.
+**Code:** [barrier timing demonstration](./barrier_demo.py) and
+[barrier integration tests](../../tests/test_barrier.py).
+
+`dist.barrier()` makes each member wait until all members of its group reach
+that point. It does not copy tensors or make Python objects identical. The
+[barrier demonstration](./barrier_demo.py) delays ranks by 0, 1, 2, and 4
+seconds and records before/after timestamps and wait duration. Rank zero
+arrives first but proceeds only when rank three arrives at about four seconds.
+A slow worker can make every faster worker idle at a synchronization point:
+the straggler problem.
 
 Run the four-rank barrier demonstration from the repository root:
 
@@ -388,11 +502,19 @@ seconds, while rank three arrives last and should wait very little.
 
 ## 9. Synchronization vs communication
 
+**Code:** [barrier](./barrier_demo.py), [broadcast](./broadcast_demo.py), and
+[reduce](./reduce_demo.py) demonstrations.
+
 Broadcast and reduce move/transform application data. Barrier establishes a coordination point. For example, rank-local tensors `[0]`, `[1]`, `[2]`, `[3]` stay different after a barrier. Synchronization is not data exchange.
 
 ## 10. Process groups
 
+**Code:** [pair-subgroup creation and broadcasts](./process_groups.py) and
+[process-group integration tests](../../tests/test_process_groups.py).
+
 ### Why have groups when WORLD already exists?
+
+**Code:** [`create_pair_groups` and `run_pair_broadcasts`](./process_groups.py).
 
 Start with four independent processes launched by `torchrun`. After
 `dist.init_process_group`, each process has a unique global rank and all four
@@ -429,6 +551,8 @@ global rank namespace from which smaller groups are created.
 
 ### Pair-group assumptions and execution
 
+**Code:** [logged pair-group demonstration](./process_groups.py).
+
 This exercise intentionally assumes exactly four world ranks. Every world rank
 calls `dist.new_group([0, 1])` and then `dist.new_group([2, 3])` in the same
 order. Consistent creation order ensures that all processes agree about the two
@@ -462,6 +586,8 @@ tensor, pipeline, or expert-parallel communication scopes.
 
 ## 11. Collective ordering
 
+**Code:** [ordering and participation failure experiments](./failures.py).
+
 Within one process group, every rank must execute compatible collectives in the
 same order. Think of the group as one distributed program whose instruction
 pointer is copied across processes. The first collective called by every rank
@@ -480,6 +606,9 @@ may wait for a slow rank. They must eventually enter the same protocol with
 compatible arguments.
 
 ## 12. Failure modes
+
+**Code:** [bounded negative experiments](./failures.py) and
+[process-group timeout setup](./distributed.py).
 
 `failures.py` deliberately breaks four parts of that protocol. These are
 negative experiments, so a nonzero exit, timeout, or apparent hang is the
@@ -518,6 +647,8 @@ experiment remains stuck.
 
 ### How to read the failure output
 
+**Code:** [the four failure branches](./failures.py).
+
 Four workers write to the same terminal, so tracebacks can be interleaved and
 their order can change between runs. Read the output in this order:
 
@@ -535,6 +666,8 @@ their order can change between runs. Read the output in this order:
    experiment was stopped, not why the collective became stuck.
 
 ### Case 1: incompatible collective order (`ordering`)
+
+**Code:** [`ordering` scenario](./failures.py).
 
 The code creates this protocol:
 
@@ -575,6 +708,8 @@ number around collectives when diagnosing an ordering bug.
 
 ### Case 2: missing participant (`missing`)
 
+**Code:** [`missing` scenario](./failures.py).
+
 R0, R1, and R2 call a barrier on WORLD. R3 skips it:
 
 | Rank | Action |
@@ -613,6 +748,8 @@ skipping a WORLD collective.
 
 ### Case 3: incompatible tensor shape (`shape`)
 
+**Code:** [`shape` scenario](./failures.py).
+
 Broadcast is in-place. It does not first broadcast a Python tensor description
 and allocate a matching result. Every non-source rank supplies its own receive
 buffer before entering the collective. The ranks therefore need a shared
@@ -650,6 +787,8 @@ buffer, and then broadcast the payload.
 
 ### Case 4: incompatible tensor dtype (`dtype`)
 
+**Code:** [`dtype` scenario](./failures.py).
+
 This experiment gives R0, R1, and R3 one `float32` element but gives R2 one
 `int64` element:
 
@@ -682,6 +821,8 @@ to one agreed dtype before entering the collective.
 
 ### Combined observation
 
+**Code:** [all failure scenarios](./failures.py).
+
 | Scenario | Broken assumption | Observed result on this machine | Main prevention |
 |---|---|---|---|
 | `ordering` | Same operation at each collective slot | Gloo timeout, then `ChildFailedError` | Keep one group-wide operation order |
@@ -699,14 +840,22 @@ it does not make an invalid protocol correct or guarantee a clear diagnosis.
 
 ## 13. Training-related examples
 
+**Code:** [mini training coordinator](./algorithms.py),
+[collective trace records](./tracing.py), and
+[structured rank records](./distributed.py).
+
 - Broadcast: rank zero owns tensor-encoded configuration (seed and step count), then all workers receive it.
 - Reduce: each worker contributes loss sum and example count; rank zero gets global totals and computes total loss / total examples. Do not average local means unless every rank has equal example counts.
 - Rank-zero logging: reduce fits when only one process needs the aggregate.
 - Barrier: establish a phase boundary, understanding that the slowest worker governs progress.
 
-`tracing.py` defines a small JSON event record (`rank`, operation, group, tensor shape, timestamp, phase), with no logging framework.
+The [tracing module](./tracing.py) defines a small JSON event record (`rank`,
+operation, group, tensor shape, timestamp, phase), with no logging framework.
 
 ## 14. Capstone: mini coordinator
+
+**Code:** [capstone implementation](./algorithms.py) and
+[capstone integration test](../../tests/test_integration.py).
 
 `algorithms.run_capstone()` uses broadcast, barrier, and reduce to coordinate a
 small four-rank job. Rank zero starts with seed 123 and 5 steps. Every rank
@@ -727,6 +876,8 @@ GLOO_SOCKET_IFNAME=lo0 uv run -- torchrun \
 On Linux, use `GLOO_SOCKET_IFNAME=lo`.
 
 ### Capstone dry run
+
+**Code:** [`run_capstone`](./algorithms.py).
 
 1. **One-to-many:** R0 starts with configuration `[123, 5]`; R1, R2, and R3
    start with `[0, 0]`. All four ranks call broadcast with `src=0`, after which
@@ -759,13 +910,18 @@ The expected output is:
 
 ## 15. Paper-and-pencil exercises
 
+**Code to compare with the derivations:** [broadcast](./broadcast_demo.py),
+[reduce](./reduce_demo.py), [barrier](./barrier_demo.py),
+[manual broadcast](./manual_broadcast.py), and
+[manual reduction](./manual_reduce.py).
+
 1. With R0=[5], R1=[9], R2=[2], R3=[7], what does every rank hold after broadcast from rank 2?
 2. With those same inputs, what does rank 3 hold after SUM reduce to rank 3? Which rank is guaranteed the final result?
 3. Explain the directional difference between broadcast and reduce.
 4. Rank 0 reaches a barrier at t=1s and rank 3 at t=8s. When can rank 0 continue, approximately? What does this show about stragglers?
 5. With 1,024 ranks and a 1 GB tensor, why could direct root-to-everyone sending be undesirable? What topology may improve scalability?
 
-Fill in before looking up the semantics:
+The completed semantics summary is:
 
 | Operation | Input location | Result location |
 |---|---|---|
@@ -773,6 +929,9 @@ Fill in before looking up the semantics:
 | Reduce | Every rank in the process group | Destination rank only |
 
 ### Answers
+
+**Code:** [native collective examples](./broadcast_demo.py),
+[reduce example](./reduce_demo.py), and [tree broadcast](./manual_broadcast.py).
 
 1. Broadcast uses R2 as the source, so R0, R1, R2, and R3 all finish with
    `[2]`. Every group member participates, including the source.
@@ -791,6 +950,12 @@ Fill in before looking up the semantics:
    tensor, reducing ideal communication depth from `O(P)` to `O(log P)` rounds.
 
 ## 16. Questions and interview checkpoint
+
+**Code reference:** [native broadcast](./broadcast_demo.py),
+[manual broadcasts](./manual_broadcast.py), [native reduce](./reduce_demo.py),
+[manual reductions](./manual_reduce.py), [barrier](./barrier_demo.py),
+[process groups](./process_groups.py), [failure modes](./failures.py), and
+[the combined capstone](./algorithms.py).
 
 Answer these after the exercises, without looking at the code:
 
@@ -813,7 +978,11 @@ Senior MLE prompts:
 - Why can a low-payload barrier be slow? Why can one slow worker limit synchronous training throughput?
 - Why use groups `{0..3}` and `{4..7}`?
 - Why might a tree broadcast beat root direct fan-out?
-- Predict the semantic difference between Reduce and AllReduce. Do not implement any later-phase operation.
+- Predict the semantic difference between Reduce and AllReduce; this phase's
+  code provides Reduce as the concrete reference point.
 - Draw an eight-rank point-to-point broadcast and an eight-rank reduction tree, showing every round.
 
-Mandatory derivations before Phase 2 is complete: draw broadcast propagation from R0 to seven peers; draw reduction in reverse; draw a barrier timeline with an early rank waiting for the last arrival. Do not move to Phase 3 until you can derive these patterns on paper.
+Phase 2 readiness check: derive broadcast propagation from R0 to seven peers,
+derive reduction in reverse, and draw a barrier timeline with an early rank
+waiting for the final arrival. If each drawing can be explained from the code
+and its logs, the core Phase 2 model is in place.
