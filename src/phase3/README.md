@@ -1,13 +1,12 @@
 # Phase 3: Why synchronous data parallel SGD needs AllReduce
 
 Start with single-process SGD. For one minibatch, compute
-$g=\nabla_\theta L(\theta;B)$, then update $\theta_{t+1}=\theta_t-\eta g$.
-With four workers and different local batches, rank $r$ computes
-$g_r=\nabla_\theta L(\theta;B_r)$. If the local batches are equal sized
+`g = grad_theta L(theta, B)` and `theta_(t+1) = theta_t - eta * g`.
+With four workers and different local batches, rank `r` computes
+`g_r = grad_theta L(theta, B_r)`.
+If the local batches are equal sized
 and each local loss is a mean, the global-batch mean gradient is
-$$
-g=\frac14(g_0+g_1+g_2+g_3).
-$$
+`g = (g_0 + g_1 + g_2 + g_3) / 4`.
 Every rank has its own model replica and independently runs `optimizer.step()`.
 So every rank needs the same aggregate gradient: the communication shape is
 many-to-everyone. That is exactly the result AllReduce provides.
@@ -68,7 +67,7 @@ each replica before the local optimizer step. AllReduce matches that shape.
 
 ## 5. Gradient averaging
 
-AllReduce SUM yields $\sum_r g_r$; divide by world size to obtain the mean
+AllReduce SUM yields `sum(g_r for r = 0..P-1)`. Divide by world size to obtain the mean
 when ranks process equally sized local batches and local losses are means.
 Why is averaging necessary to match a mean loss on the concatenated global
 batch? Would it still be correct if ranks processed different numbers of
@@ -76,26 +75,44 @@ examples? Explain your assumptions before coding.
 
 ### Paper-and-pencil derivation 1: equal batches
 
-For $B=B_0\cup B_1$, derive
-$\nabla L_B=\frac12(\nabla L_{B_0}+\nabla L_{B_1})$ when the two local
-batches have equal size and each loss is a sample mean. Generalize to $P$
-ranks. Then draw four replicas each calling `optimizer.step()` and explain why
-each needs the same gradient.
+For two equally sized local batches, each local mean gradient gives every
+example within that batch weight `1 / |B_0|`. Since the global batch has twice
+as many examples, each local mean contributes half of the global mean:
+
+`g_global = grad(L_(B_0 union B_1)) = (grad(L_B0) + grad(L_B1)) / 2 = (g_0 + g_1) / 2`.
+
+For `P` equal-sized rank-local batches, generalize this to
+`g_global = (1 / P) * sum(g_r for r = 0..P-1)`.
+
+Then draw four replicas each calling `optimizer.step()` and explain why each
+needs the same gradient.
 
 ## 6. Unequal local batches
 
-If each rank computes a local **mean** gradient, equal rank weighting is wrong
-when sample counts differ. For counts $n_r$, derive
-$$
-g_{global}=\frac{\sum_r n_r g_r}{\sum_r n_r}.
-$$
-For 2 and 8 samples, explain why $(g_0+g_1)/2$ gives the two ranks equal
-weight rather than the examples equal weight. Implement weighted aggregation.
+If rank `r` processes `n_r` examples and computes a local **mean** gradient,
+then that gradient is
+
+`g_r = (1 / n_r) * sum(grad_theta(loss_(r,i)) for i = 1..n_r)`.
+
+Therefore, `n_r * g_r` is the sum of its per-example gradients. Add those sums
+across ranks and divide by the total number of examples to get the global mean:
+
+`g_global = sum(n_r * g_r for r = 0..P-1) / sum(n_r for r = 0..P-1)`
+
+Equivalently, `g_global` is the sum of all per-example gradients divided by
+the total number of examples.
+
+For 2 and 8 samples, explain why the unweighted mean of `g_0` and `g_1` gives the two ranks equal
+weight rather than the examples equal weight. The count-weighted expression
+gives each example equal weight. If a rank has zero examples, it contributes
+zero to both the gradient sum and sample count; the global total must still be
+positive. Implement weighted aggregation.
 
 ### Paper-and-pencil derivation 2
 
-Expand each local mean into its sum of per-example gradients and derive the
-weighted formula. State how you would handle a rank with zero examples.
+Starting from `g_r = (sum of rank r's per-example gradients) / n_r`, derive
+the weighted formula without looking above. State how you would handle a rank with
+zero examples and what to do if the global sample count is zero.
 
 ## 7. Manual AllReduce
 
@@ -153,8 +170,9 @@ replicas. What changes if a rank has zero samples, or if loss reduction is sum?
 
 ## 12. Communication cost
 
-Use the rough model $T\approx\alpha+\beta n$, where $\alpha$ is startup
-latency, $\beta$ is time per byte, and $n$ is payload size. Why could a
+Use the rough communication model `T ≈ α + βn`,
+where `alpha` is startup latency, `beta` is time per byte, and `n` is payload
+size. Why could a
 thousand tiny collectives cost more than fewer larger ones? This motivates
 gradient buckets; it is not a precise network performance model.
 
@@ -228,7 +246,7 @@ Answer these without looking at code:
 Without DDP, implement `torchrun → identical replicas → different local
 minibatches → forward/backward → AllReduce → identical global gradients →
 optimizer.step() → identical replicas`. Numerically prove that one process on a
-global batch and $P$ processes on equivalent local batches produce the same
+global batch and `P` processes on equivalent local batches produce the same
 SGD update under matching assumptions. The key reasoning is mathematical:
 synchronous replicated SGD requires each rank to obtain the same aggregate
 gradient, and AllReduce has precisely those semantics.
