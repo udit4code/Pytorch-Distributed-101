@@ -54,7 +54,7 @@ gradient before it updates its own model replica.
 Make sure PyTorch is installed in the active Python environment, then run:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.all_reduce_demo
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.all_reduce_demo
 ```
 
 Each process prints a JSON record before and after AllReduce. In the records
@@ -68,7 +68,7 @@ The integration test launches a real `torchrun` subprocess; it does not mock
 `torch.distributed`. From the repository root, run:
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q tests/test_all_reduce.py::test_all_reduce_demo_returns_expected_sum_on_every_rank
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_all_reduce.py::test_all_reduce_demo_returns_expected_sum_on_every_rank
 ```
 
 This test checks that the command exits successfully, observes output from all
@@ -226,14 +226,14 @@ rank. Rank 0 has no examples, so the check also verifies that its placeholder
 gradient is zeroed before aggregation.
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q tests/test_gradient_sync.py::test_equal_and_unequal_gradient_aggregation
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_gradient_sync.py::test_equal_and_unequal_gradient_aggregation
 ```
 
 The test parses each rank's JSON record and checks both results. To run the
 same worker check directly, use:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.gradient_sync --self-check
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.gradient_sync --self-check
 ```
 
 ### Derivation 2: global-batch gradient for unequal local batches
@@ -337,14 +337,14 @@ Run both methods on four real processes and compare each result against native
 AllReduce:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.manual_all_reduce --self-check
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.manual_all_reduce --self-check
 ```
 
 Each rank prints a JSON record with `"phase": "passed"` if both manual
 results equal `[10, 100]`. The focused pytest integration test is:
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q tests/test_manual_all_reduce.py::test_manual_reduce_broadcast_and_point_to_point_match_native
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_manual_all_reduce.py::test_manual_reduce_broadcast_and_point_to_point_match_native
 ```
 
 Do not call Reduce, Broadcast, or AllReduce inside the point-to-point function;
@@ -365,9 +365,20 @@ reproducible while changing its ordering.
 
 Compare same-seed model construction on every rank with different seeds. Ask:
 if gradients are averaged but replicas start from different weights, do they
-necessarily become identical? Broadcast rank 0's parameters and verify exact
-agreement before training. Parameter broadcast here intentionally excludes
-buffers; consider what a model with mutable buffers would require.
+necessarily become identical? The update is `theta_r_new = theta_r_old - eta*g`.
+If every rank receives the same `g` but starts from a different `theta_r_old`,
+the same update is added to different starting values; gradient averaging does
+not remove the initial difference. Broadcast rank 0's parameters first so every
+replica starts from the same state. Parameter broadcast here intentionally
+excludes buffers; consider what a model with mutable buffers would require.
+
+The real four-rank self-check verifies same-seed equality, observes that
+different seeds produce divergence, broadcasts rank 0's parameters, then
+verifies equality again:
+
+```bash
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_parameter_consistency.py::test_broadcast_parameters_makes_replicas_equal
+```
 
 ## 10. Manual distributed SGD
 
@@ -419,7 +430,7 @@ four produces the gradient of the mean loss over all 16 examples.
 Run with:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 3 --self-check
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 3 --self-check
 ```
 
 Every run checks replica equality after each step. With `--self-check`, it also
@@ -430,14 +441,14 @@ per step, including loss, batch sizes, and maximum parameter differences.
 The opt-in integration test runs the same comparison and checks its output:
 
 ```bash
-RUN_DISTRIBUTED=1 python -m pytest -q tests/test_distributed_sgd.py::test_one_and_multiple_steps_match_reference_and_stay_synchronized
+PYTHONPATH=src RUN_DISTRIBUTED=1 python -m pytest -q tests/test_distributed_sgd.py::test_one_and_multiple_steps_match_reference_and_stay_synchronized
 ```
 
 `--sync-gradients=false` is a separate experiment: identical initial replicas
 see different data, step on different gradients, and diverge. Verify that with:
 
 ```bash
-GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 1 --sync-gradients=false
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.distributed_sgd --steps 1 --sync-gradients=false
 ```
 
 ## 11. Correctness against single-process SGD
