@@ -498,10 +498,65 @@ computation shrinks while communication and synchronization remain?
 
 ## 14. Async communication
 
-Launch `all_reduce(..., async_op=True)`, do independent CPU work, then call
-`wait()` before consuming the result. What could go wrong if the tensor is read
-before completion? Gloo on localhost is for semantic learning here; do not
-infer useful performance overlap from the toy timing.
+### What changes when AllReduce is asynchronous?
+
+With the default `async_op=False`, a call such as `dist.all_reduce(tensor)` is
+blocking from the caller's point of view: the Python process waits for the
+collective to finish before moving to the next line. When it returns, it is
+safe to consume the reduced value.
+
+With `async_op=True`, the call starts the collective and quickly returns a
+`Work` handle. The handle represents that particular operation. The collective
+may still be running while Python executes later statements:
+
+```text
+blocking call:
+  call AllReduce ───── wait for communication ───── return; read result
+
+asynchronous call:
+  launch AllReduce ── return Work ── independent work ── Work.wait() ── read result
+       communication may continue in the background ───────────────────┘
+```
+
+Asynchronous changes **when the caller waits**, not the mathematical result.
+All ranks still have to launch compatible collectives in the same order, and
+every rank eventually has to wait before using its result.
+
+### What exactly does `wait()` do?
+
+`work.wait()` tells this process to block until the operation represented by
+`work` has completed for this rank. After it returns, the AllReduce result in
+the tensor is ready to read. It does not mean that every peer has moved on to
+the next Python statement, and it does not excuse ranks from matching the
+collective sequence.
+
+Before `wait()`, treat the participating tensor as owned by the in-flight
+operation: do not read it as the final result, overwrite it, or reuse its
+storage for another operation. Reading too early can observe the original
+local value, a partially updated value, or backend-dependent behavior. Waiting
+first removes that race.
+
+### Live four-rank example
+
+`async_all_reduce.py` gives rank `r` the scalar `r + 1`, launches SUM, computes
+an unrelated sum of squares, waits, and only then prints the reduced tensor.
+For four ranks the expected collective result is
+`1 + 2 + 3 + 4 = 10` on every rank; the independent CPU computation is `332833500`.
+
+Run from the repository root on macOS:
+
+```bash
+PYTHONPATH=src GLOO_SOCKET_IFNAME=lo0 torchrun --nnodes=1 --nproc-per-node=4 --master-addr=127.0.0.1 --master-port=29517 -m phase3.async_all_reduce
+```
+
+Each process should print `sum=10`. Output order is nondeterministic because
+the ranks print independently.
+
+The independent CPU work is safe because it does not touch the tensor involved
+in AllReduce. This example teaches the `Work`/`wait()` lifecycle; it does not
+prove useful communication-computation overlap. Gloo on localhost may finish
+the collective before, during, or after that small CPU calculation, and its
+timing is not representative of a training cluster.
 
 ## 15. Why naive gradient synchronization is inefficient
 
